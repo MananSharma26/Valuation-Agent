@@ -1,0 +1,172 @@
+{
+  "version": "v1",
+  "created": "2026-04-30",
+  "philosophy": "Books teach principles, examples provide ground truth, datasets supply current parameters. LLM agents learn from books; deterministic engines validate against examples; all agents consume datasets at runtime.",
+
+  "phases": [
+    {
+      "phase": 1,
+      "name": "Foundation — Data Layer",
+      "goal": "Make all 244 Damodaran datasets programmatically accessible",
+      "learn_from": "datasets",
+      "outputs": [
+        "Damodaran Excel loader (parse all .xls/.xlsx into normalized DataFrames)",
+        "Industry name registry (canonical list of Damodaran industries)",
+        "Region-aware data accessor (query by industry + region)"
+      ],
+      "validation": "Every dataset loads without error; row counts match source files"
+    },
+    {
+      "phase": 2,
+      "name": "Foundation — Financial Data Ingestion",
+      "goal": "Fetch and normalize company financials from APIs and manual input",
+      "learn_from": "examples (to understand what fields are needed)",
+      "outputs": [
+        "Yahoo Finance client (income statement, balance sheet, cash flow, key stats)",
+        "Manual input schema (what to ask for if API fails)",
+        "Financial normalizer (standardize field names, handle missing data)"
+      ],
+      "validation": "Fetch financials for 5 example companies; all required DCF fields present"
+    },
+    {
+      "phase": 3,
+      "name": "Core Engine — DCF",
+      "goal": "Deterministic FCFF and FCFE models that reproduce Damodaran's example outputs",
+      "learn_from": "examples + books (Damodaran on Valuation ch. 4-6, 12-15)",
+      "outputs": [
+        "FCFF model (revenue → EBIT → NOPAT → FCFF → enterprise value)",
+        "FCFE model (net income → FCFE → equity value)",
+        "Terminal value (perpetuity growth + exit multiple)",
+        "Sensitivity table generator"
+      ],
+      "validation": "Reproduce Amazon 2018, 3M, Amgen, Tata Steel valuations within 10%",
+      "golden_tests": [
+        {"company": "Amazon 2018", "file": "AmazonSept18.xlsx", "type": "growth"},
+        {"company": "3M pre-crisis", "file": "3Mprecrisis.xls", "type": "mature"},
+        {"company": "3M post-crisis", "file": "3Mpostcrisis.xls", "type": "mature"},
+        {"company": "Amgen", "file": "amgen.xls", "type": "mature_pharma"},
+        {"company": "Tata Steel", "file": "tatasteel.xls", "type": "emerging_cyclical"},
+        {"company": "Tata Chemicals", "file": "tatachemicals.xls", "type": "emerging"},
+        {"company": "TCS", "file": "tcs.xls", "type": "emerging_growth"},
+        {"company": "Toyota", "file": "toyota.xls", "type": "mature_cyclical"},
+        {"company": "ConEd", "file": "coned08.xls", "type": "utility"},
+        {"company": "Exxon", "file": "exxon09.xls", "type": "mature_commodity"},
+        {"company": "Hormel", "file": "hormel.xls", "type": "mature_stable"},
+        {"company": "Sears", "file": "sears.xls", "type": "distressed"}
+      ]
+    },
+    {
+      "phase": 4,
+      "name": "Risk & Cost of Capital",
+      "goal": "Compute WACC from Damodaran building blocks",
+      "learn_from": "datasets (betas, ERP, country risk, ratings, tax rates)",
+      "outputs": [
+        "Beta estimator (company beta or industry unlevered beta re-levered)",
+        "Equity risk premium calculator (base ERP + country risk premium)",
+        "Cost of debt estimator (synthetic rating from interest coverage)",
+        "WACC assembler"
+      ],
+      "validation": "WACC outputs match Damodaran wacc.xls for 10+ industries"
+    },
+    {
+      "phase": 5,
+      "name": "Relative Valuation Engine",
+      "goal": "Compare company multiples to Damodaran industry benchmarks",
+      "learn_from": "datasets (PE, PBV, PS, EV/EBITDA) + books (ch. 7-8)",
+      "outputs": [
+        "Multiple calculator (compute company PE, EV/EBITDA, PBV, PS)",
+        "Industry comparator (rank vs. Damodaran industry average/median)",
+        "Implied value from multiples"
+      ],
+      "validation": "Correct industry match and multiple comparison for 5 companies"
+    },
+    {
+      "phase": 6,
+      "name": "Company Classifier",
+      "goal": "Auto-classify company type to route to correct model",
+      "learn_from": "books (Dark Side of Valuation — ch. 1-3 on company lifecycle)",
+      "outputs": [
+        "Classification taxonomy: {mature, growth, young, distressed, cyclical, financial}",
+        "Rule-based pre-classifier (SIC code, negative earnings, bank/insurance sector)",
+        "LLM refinement prompt for ambiguous cases"
+      ],
+      "validation": "Correctly classify all 20 example companies"
+    },
+    {
+      "phase": 7,
+      "name": "Excess Returns Engine (Financials)",
+      "goal": "Value banks and financial firms using equity excess return model",
+      "learn_from": "books (Damodaran on Valuation ch. 17) + examples",
+      "outputs": [
+        "Excess return model (ROE - COE × book value, with growth)",
+        "Regulatory capital adjustments"
+      ],
+      "validation": "Reproduce Goldman Sachs, Wells Fargo 2008, Deutsche Bank within 15%",
+      "golden_tests": [
+        {"company": "Goldman Sachs", "file": "goldman.xls"},
+        {"company": "Wells Fargo", "file": "wellsfargo2008.xls"},
+        {"company": "Deutsche Bank", "file": "DBk09.xls"}
+      ]
+    },
+    {
+      "phase": 8,
+      "name": "Growth Estimator",
+      "goal": "Propose growth assumptions from fundamentals + narrative",
+      "learn_from": "datasets (historical growth, ROE, fundamental growth) + books",
+      "outputs": [
+        "Historical growth analyzer",
+        "Fundamental growth calculator (retention × ROE, reinvestment × ROIC)",
+        "LLM narrative growth prompt (industry trends, competitive position)",
+        "Growth assumption reconciler"
+      ],
+      "validation": "Growth assumptions within reasonable range for all example companies"
+    },
+    {
+      "phase": 9,
+      "name": "Cross-Validator & Confidence Scoring",
+      "goal": "Reconcile multiple model outputs and score confidence",
+      "learn_from": "all prior outputs",
+      "outputs": [
+        "Model divergence calculator",
+        "Confidence scorer (data quality + model agreement + sensitivity)",
+        "Divergence explainer (LLM prompt)"
+      ],
+      "validation": "Confidence score correlates with actual estimation error on examples"
+    },
+    {
+      "phase": 10,
+      "name": "Report Generator & Orchestrator",
+      "goal": "Interactive conversation loop + structured output",
+      "learn_from": "books (narrative + numbers philosophy)",
+      "outputs": [
+        "Report template (markdown)",
+        "Orchestrator prompts for Claude Code",
+        "Assumption override handler",
+        "CLAUDE.md with valuation workflow instructions"
+      ],
+      "validation": "End-to-end valuation of 3 companies produces professional-quality reports"
+    }
+  ],
+
+  "book_knowledge_extraction": {
+    "damodaran_on_valuation": {
+      "chapters_for_v1": [
+        {"ch": "1-3", "topic": "Valuation foundations, approaches overview", "agent": "classifier, orchestrator"},
+        {"ch": "4-6", "topic": "DCF mechanics — FCFF, FCFE, terminal value", "agent": "dcf_engine"},
+        {"ch": "7-8", "topic": "Relative valuation — multiples selection and comparison", "agent": "relative_engine"},
+        {"ch": "9-11", "topic": "Estimating inputs — risk, growth, cash flows", "agent": "risk_assessor, growth_estimator"},
+        {"ch": "12-15", "topic": "Applying DCF in practice — stable, growth, emerging", "agent": "dcf_engine, growth_estimator"},
+        {"ch": "17", "topic": "Valuing financial service firms", "agent": "excess_returns_engine"}
+      ],
+      "encoding_method": "Extract decision rules and formulas into config/prompts/ as system prompt context"
+    },
+    "dark_side_of_valuation": {
+      "chapters_for_v1": [
+        {"ch": "1-3", "topic": "Company lifecycle classification", "agent": "classifier"},
+        {"ch": "9-10", "topic": "Valuing young and growth companies", "agent": "growth_estimator, dcf_engine"},
+        {"ch": "11-12", "topic": "Valuing distressed and declining firms", "agent": "classifier, dcf_engine"}
+      ],
+      "encoding_method": "Extract classification heuristics into classifier rules; extract adjustment methods into engine configs"
+    }
+  }
+}
