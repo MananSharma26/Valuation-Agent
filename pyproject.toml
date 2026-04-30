@@ -1,0 +1,26 @@
+[project]
+name = "valuation-agent"
+version = "0.1.0"
+description = "Multi-agent valuation system using Damodaran methodology"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.0",
+    "xlrd>=2.0",
+    "openpyxl>=3.1",
+    "yfinance>=0.2",
+    "thefuzz>=0.22",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-cov>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
