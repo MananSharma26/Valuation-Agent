@@ -481,3 +481,198 @@ class TestMdTableHelper:
         result = _md_table(["H"], [])
         assert isinstance(result, str)
         assert "H" in result
+
+
+# ---------------------------------------------------------------------------
+# Analyst Coverage & Consensus section
+# ---------------------------------------------------------------------------
+
+
+def _make_analyst_ctx() -> ValuationContext:
+    """Context with analyst_data and ibes_data populated in key_stats."""
+    import pandas as pd
+
+    ctx = ValuationContext("AAPL")
+    ctx.company.name = "Apple Inc."
+    ctx.company.classification = "mature"
+    ctx.company.region = "US"
+
+    ctx.financials.key_stats = {
+        "price": 180.00,
+        "analyst_data": {
+            "price_targets": {
+                "targetMean": 210.50,
+                "targetHigh": 240.00,
+                "targetLow": 175.00,
+                "targetMedian": 208.00,
+                "numberOfAnalysts": 32,
+            },
+            "recommendations": None,
+            "earnings_estimate": None,
+        },
+        "ibes_data": {
+            "ticker": "AAPL",
+            "estimates": pd.DataFrame([
+                {"statpers": "2024-12", "meanest": 6.71, "medest": 6.70, "numest": 28},
+                {"statpers": "2025-03", "meanest": 1.55, "medest": 1.54, "numest": 25},
+            ]),
+        },
+    }
+
+    ctx.outputs.dcf_fcff = {
+        "enterprise_value": 3_000_000_000_000.0,
+        "equity_value": 2_900_000_000_000.0,
+        "equity_value_per_share": 195.00,
+        "pv_high_growth": 800_000_000_000.0,
+        "pv_terminal": 2_200_000_000_000.0,
+        "terminal_value": 4_100_000_000_000.0,
+        "yearly_fcff": [],
+        "yearly_pv": [],
+        "yearly_ebit_at": [],
+    }
+
+    return ctx
+
+
+class TestAnalystConsensusSection:
+    def test_section_present_when_analyst_data_available(self):
+        ctx = _make_analyst_ctx()
+        report = generate_report(ctx)
+        assert "## Analyst Coverage & Consensus" in report
+
+    def test_disclaimer_present(self):
+        ctx = _make_analyst_ctx()
+        report = generate_report(ctx)
+        assert "COMPARISON" in report
+        assert "not used as dcf input" in report.lower()
+
+    def test_price_targets_subsection(self):
+        ctx = _make_analyst_ctx()
+        report = generate_report(ctx)
+        assert "### Price Targets" in report
+        assert "210.50" in report  # targetMean
+        assert "240.00" in report  # targetHigh
+        assert "175.00" in report  # targetLow
+        assert "32" in report  # numberOfAnalysts
+
+    def test_comparison_table_present(self):
+        ctx = _make_analyst_ctx()
+        report = generate_report(ctx)
+        assert "### Our Estimate vs Consensus" in report
+        assert "Our DCF (FCFF)" in report
+        assert "Analyst Mean Target" in report
+        assert "Market Price" in report
+
+    def test_vs_market_column_computed(self):
+        ctx = _make_analyst_ctx()
+        report = generate_report(ctx)
+        # DCF=195, price=180 => +8.3% upside
+        assert "+8.3%" in report
+
+    def test_ibes_subsection_present(self):
+        ctx = _make_analyst_ctx()
+        report = generate_report(ctx)
+        assert "I/B/E/S Estimates" in report
+        assert "6.71" in report  # mean EPS value
+
+    def test_ibes_ticker_shown(self):
+        ctx = _make_analyst_ctx()
+        report = generate_report(ctx)
+        assert "AAPL" in report  # ibes ticker
+
+    def test_section_absent_when_no_analyst_data(self):
+        """Section should be omitted when neither analyst_data nor ibes_data is present."""
+        ctx = _make_minimal_ctx()
+        report = generate_report(ctx)
+        assert "## Analyst Coverage & Consensus" not in report
+
+    def test_section_absent_when_key_stats_empty(self):
+        ctx = ValuationContext("XYZ")
+        ctx.company.name = "XYZ Corp"
+        report = generate_report(ctx)
+        assert "## Analyst Coverage & Consensus" not in report
+
+    def test_section_present_with_ibes_only(self):
+        """Section renders when only ibes_data is present (no YF price targets)."""
+        import pandas as pd
+
+        ctx = ValuationContext("TCS.NS")
+        ctx.company.name = "Tata Consultancy"
+        ctx.financials.key_stats = {
+            "ibes_data": {
+                "ticker": "TCS",
+                "estimates": pd.DataFrame([
+                    {"statpers": "2024-12", "meanest": 95.0, "medest": 94.5, "numest": 10},
+                ]),
+            }
+        }
+        report = generate_report(ctx)
+        assert "## Analyst Coverage & Consensus" in report
+        assert "I/B/E/S Estimates" in report
+        assert "95.00" in report
+
+    def test_section_present_with_price_targets_only(self):
+        """Section renders when only analyst_data price targets are present (no ibes)."""
+        ctx = ValuationContext("MSFT")
+        ctx.company.name = "Microsoft"
+        ctx.financials.key_stats = {
+            "price": 400.0,
+            "analyst_data": {
+                "price_targets": {
+                    "targetMean": 450.0,
+                    "targetHigh": 500.0,
+                    "targetLow": 390.0,
+                    "targetMedian": 448.0,
+                    "numberOfAnalysts": 40,
+                },
+                "recommendations": None,
+                "earnings_estimate": None,
+            },
+        }
+        report = generate_report(ctx)
+        assert "## Analyst Coverage & Consensus" in report
+        assert "Price Targets" in report
+        assert "450.00" in report
+
+    def test_section_order_between_cross_validation_and_sensitivity(self):
+        """Analyst section should appear after Cross-Validation and before Sensitivity."""
+        ctx = _make_analyst_ctx()
+        # Add sensitivity data too
+        ctx.outputs.sensitivity = {"bear_case": 150.0, "bull_case": 250.0}
+        report = generate_report(ctx)
+        cv_pos = report.find("## Cross-Validation")
+        analyst_pos = report.find("## Analyst Coverage & Consensus")
+        sens_pos = report.find("## Sensitivity Analysis")
+        assert cv_pos < analyst_pos < sens_pos, (
+            f"Expected Cross-Validation ({cv_pos}) < Analyst ({analyst_pos}) < Sensitivity ({sens_pos})"
+        )
+
+    def test_no_crash_with_empty_ibes_dataframe(self):
+        """Gracefully handle empty estimates DataFrame."""
+        import pandas as pd
+
+        ctx = ValuationContext("EMPTY")
+        ctx.company.name = "Empty Co"
+        ctx.financials.key_stats = {
+            "ibes_data": {
+                "ticker": "EMPTY",
+                "estimates": pd.DataFrame(),
+            }
+        }
+        report = generate_report(ctx)
+        assert isinstance(report, str)
+
+    def test_no_crash_with_none_price_targets(self):
+        """Gracefully handle analyst_data where price_targets is None."""
+        ctx = ValuationContext("NOPTS")
+        ctx.company.name = "No Targets Co"
+        ctx.financials.key_stats = {
+            "analyst_data": {
+                "price_targets": None,
+                "recommendations": None,
+                "earnings_estimate": None,
+            }
+        }
+        report = generate_report(ctx)
+        # With no price targets and no ibes, section should be absent
+        assert "## Analyst Coverage & Consensus" not in report

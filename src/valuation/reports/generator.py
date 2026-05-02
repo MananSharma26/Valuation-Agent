@@ -47,6 +47,7 @@ def generate_report(ctx: ValuationContext) -> str:
         _section_dcf_valuation(ctx),
         _section_relative_valuation(ctx),
         _section_cross_validation(ctx),
+        _section_analyst_consensus(ctx),
         _section_sensitivity_analysis(ctx),
         _section_confidence_assessment(ctx),
     ]
@@ -481,6 +482,144 @@ def _section_cross_validation(ctx: ValuationContext) -> str:
         lines.append("")
         for flag in flags:
             lines.append(f"- {flag}")
+
+    return "\n".join(lines)
+
+
+def _section_analyst_consensus(ctx: ValuationContext) -> str:
+    """Render the Analyst Coverage & Consensus section.
+
+    Data sources (all optional):
+    - ctx.financials.key_stats["analyst_data"]  — from fetch_analyst_data()
+    - ctx.financials.key_stats["ibes_data"]     — from WRDS I/B/E/S fetch
+    - ctx.financials.key_stats["price"]         — current market price
+    - ctx.outputs.dcf_fcff / dcf_fcfe / relative — our own model values
+    """
+    ks = ctx.financials.key_stats or {}
+    analyst_data: dict | None = ks.get("analyst_data")
+    ibes_data: dict | None = ks.get("ibes_data")
+
+    has_price_targets = bool(
+        analyst_data and analyst_data.get("price_targets")
+    )
+    has_ibes = bool(ibes_data and ibes_data.get("estimates") is not None)
+
+    if not has_price_targets and not has_ibes:
+        return ""
+
+    lines = [
+        "## Analyst Coverage & Consensus",
+        "",
+        "> Consensus estimates shown for COMPARISON — not used as DCF inputs.",
+    ]
+
+    # ----------------------------------------------------------------
+    # Price Targets block
+    # ----------------------------------------------------------------
+    if has_price_targets:
+        pt = analyst_data["price_targets"]  # type: ignore[index]
+        pt_rows = [
+            ("Mean Target", _fmt(pt.get("targetMean"), prefix="$")),
+            ("Median Target", _fmt(pt.get("targetMedian"), prefix="$")),
+            ("High Target", _fmt(pt.get("targetHigh"), prefix="$")),
+            ("Low Target", _fmt(pt.get("targetLow"), prefix="$")),
+            ("# Analysts", str(pt.get("numberOfAnalysts") or "N/A")),
+        ]
+        lines += ["", "### Price Targets", "", _md_table(["Metric", "Value"], pt_rows)]
+
+    # ----------------------------------------------------------------
+    # Our Estimate vs Consensus comparison table
+    # ----------------------------------------------------------------
+    market_price: float | None = ks.get("price")
+
+    # Collect our own model values
+    our_values: list[tuple[str, float]] = []
+    if ctx.outputs.dcf_fcff:
+        v = ctx.outputs.dcf_fcff.get("equity_value_per_share")
+        if v is not None:
+            our_values.append(("Our DCF (FCFF)", float(v)))
+    if ctx.outputs.dcf_fcfe:
+        v = ctx.outputs.dcf_fcfe.get("value_per_share")
+        if v is not None:
+            our_values.append(("Our DDM", float(v)))
+    if ctx.outputs.relative:
+        v = ctx.outputs.relative.get("composite_value")
+        if v is not None:
+            our_values.append(("Our Relative (composite)", float(v)))
+
+    analyst_mean: float | None = None
+    if has_price_targets:
+        pt = analyst_data["price_targets"]  # type: ignore[index]
+        analyst_mean = pt.get("targetMean")
+
+    if our_values or analyst_mean is not None or market_price is not None:
+        lines += ["", "### Our Estimate vs Consensus", ""]
+
+        def _vs_market(val: float | None, price: float | None) -> str:
+            if val is None or price is None or float(price) == 0:
+                return "—"
+            pct = (val - float(price)) / float(price) * 100
+            sign = "+" if pct >= 0 else ""
+            return f"{sign}{pct:.1f}%"
+
+        comparison_rows: list[tuple[str, str, str]] = []
+        for model_name, model_val in our_values:
+            comparison_rows.append((
+                model_name,
+                _fmt(model_val, prefix="$"),
+                _vs_market(model_val, market_price),
+            ))
+        if analyst_mean is not None:
+            comparison_rows.append((
+                "Analyst Mean Target",
+                _fmt(analyst_mean, prefix="$"),
+                _vs_market(analyst_mean, market_price),
+            ))
+        if market_price is not None:
+            comparison_rows.append(("Market Price", _fmt(market_price, prefix="$"), "—"))
+
+        lines.append(_md_table(["Model", "Value", "vs Market"], comparison_rows))
+
+    # ----------------------------------------------------------------
+    # I/B/E/S Estimates block
+    # ----------------------------------------------------------------
+    if has_ibes:
+        estimates = ibes_data["estimates"]  # type: ignore[index]
+        ibes_ticker = ibes_data.get("ticker", "N/A")  # type: ignore[index]
+
+        lines += [
+            "",
+            f"### I/B/E/S Estimates (ticker: {ibes_ticker})",
+            "",
+        ]
+
+        try:
+            import pandas as pd  # noqa: PLC0415
+
+            if isinstance(estimates, pd.DataFrame) and not estimates.empty:
+                ibes_rows: list[tuple] = []
+                for _, row in estimates.head(8).iterrows():
+                    period = str(row.get("statpers", row.get("fpedats", "N/A")))
+                    mean_eps = row.get("meanest", row.get("mean", None))
+                    median_eps = row.get("medest", row.get("median", None))
+                    num_est = row.get("numest", row.get("numanalysts", None))
+                    ibes_rows.append((
+                        period,
+                        _fmt(float(mean_eps), decimals=2) if mean_eps is not None else "N/A",
+                        _fmt(float(median_eps), decimals=2) if median_eps is not None else "N/A",
+                        str(int(num_est)) if num_est is not None else "N/A",
+                    ))
+                if ibes_rows:
+                    lines.append(_md_table(
+                        ["Period", "Mean EPS", "Median EPS", "# Analysts"],
+                        ibes_rows,
+                    ))
+                else:
+                    lines.append("_No estimate rows available._")
+            else:
+                lines.append("_No I/B/E/S estimate data available._")
+        except Exception:
+            lines.append("_I/B/E/S data could not be rendered._")
 
     return "\n".join(lines)
 

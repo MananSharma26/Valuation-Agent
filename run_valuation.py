@@ -16,7 +16,7 @@ import sys
 from datetime import date
 
 # ---- All imports ----
-from valuation.data.api_client import fetch_financials
+from valuation.data.api_client import fetch_financials, fetch_analyst_data
 from valuation.data.normalizer import normalize
 from valuation.data.damodaran_loader import DamodaranLoader
 from valuation.agents.industry_mapper import match_industry, load_industry_benchmarks
@@ -414,8 +414,23 @@ def run(ticker: str, growth_override: float | None = None,
         for _, row in est.head(4).iterrows():
             print(f"    {row.get('statpers','')}: Mean EPS={row.get('meanest','N/A')}, Analysts={row.get('numest','N/A')}")
         print(f"  (Shown for COMPARISON — NOT used as DCF input)")
+        ctx.financials.key_stats["ibes_data"] = ibes_data
     else:
         print(f"  No I/B/E/S data available (WRDS may not be configured)")
+
+    # Yahoo Finance analyst price targets & recommendations
+    print(f"  Fetching Yahoo Finance analyst data for {ticker}...")
+    analyst_data = fetch_analyst_data(ticker)
+    if analyst_data:
+        pt = analyst_data.get("price_targets")
+        if pt:
+            print(f"  Analyst Mean Target: {pt.get('targetMean', 'N/A')} | # Analysts: {pt.get('numberOfAnalysts', 'N/A')}")
+        else:
+            print(f"  No price target data from Yahoo Finance")
+        ctx.financials.key_stats["analyst_data"] = analyst_data
+    else:
+        print(f"  No analyst data available from Yahoo Finance")
+    print(f"  (Shown for COMPARISON — NOT used as DCF input)")
 
     # ================================================================
     # STEP 11: Cross-Validation

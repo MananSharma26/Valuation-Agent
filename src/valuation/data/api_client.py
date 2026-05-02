@@ -27,6 +27,96 @@ class CompanyData:
     book_value_per_share: float = 0
 
 
+def fetch_analyst_data(ticker: str) -> dict | None:
+    """Fetch analyst price targets and recommendations from Yahoo Finance.
+
+    Parameters
+    ----------
+    ticker : str
+        Stock ticker symbol (e.g., "AAPL", "TCS.NS").
+
+    Returns
+    -------
+    dict | None
+        Dictionary with keys:
+        - "price_targets": dict with targetMean, targetHigh, targetLow,
+          targetMedian, numberOfAnalysts (or None if unavailable)
+        - "recommendations": list of recent recommendation dicts (or None)
+        - "earnings_estimate": dict of forward EPS estimate data (or None)
+        Returns None if yfinance is unavailable or the ticker is invalid.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise ImportError("yfinance is required: pip install yfinance")
+
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        if not info:
+            return None
+    except Exception:
+        return None
+
+    result: dict = {}
+
+    # --- Price targets ---
+    try:
+        pt = stock.analyst_price_targets
+        if pt is not None and isinstance(pt, dict) and pt:
+            result["price_targets"] = {
+                "targetMean": pt.get("mean"),
+                "targetHigh": pt.get("high"),
+                "targetLow": pt.get("low"),
+                "targetMedian": pt.get("median"),
+                "numberOfAnalysts": pt.get("numberOfAnalysts"),
+            }
+        else:
+            # Fall back to info dict fields
+            mean = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+            if mean is not None:
+                result["price_targets"] = {
+                    "targetMean": info.get("targetMeanPrice"),
+                    "targetHigh": info.get("targetHighPrice"),
+                    "targetLow": info.get("targetLowPrice"),
+                    "targetMedian": info.get("targetMedianPrice"),
+                    "numberOfAnalysts": info.get("numberOfAnalystOpinions"),
+                }
+            else:
+                result["price_targets"] = None
+    except Exception:
+        result["price_targets"] = None
+
+    # --- Recommendations ---
+    try:
+        recs = stock.recommendations
+        if recs is not None and not recs.empty:
+            # Keep last 5 rows, convert to list of dicts (dates as strings)
+            recent = recs.tail(5).reset_index()
+            result["recommendations"] = recent.to_dict(orient="records")
+        else:
+            result["recommendations"] = None
+    except Exception:
+        result["recommendations"] = None
+
+    # --- Earnings / EPS estimate ---
+    try:
+        ee = stock.earnings_estimate
+        if ee is not None and not ee.empty:
+            result["earnings_estimate"] = ee.to_dict()
+        else:
+            # Try growth_estimates as fallback
+            ge = stock.growth_estimates
+            if ge is not None and not ge.empty:
+                result["earnings_estimate"] = ge.to_dict()
+            else:
+                result["earnings_estimate"] = None
+    except Exception:
+        result["earnings_estimate"] = None
+
+    return result if result else None
+
+
 def fetch_financials(ticker: str) -> CompanyData | None:
     """Fetch financial statements and key stats from Yahoo Finance.
     Returns None if the ticker is invalid or data cannot be fetched.
