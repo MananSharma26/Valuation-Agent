@@ -4,6 +4,7 @@ dcf.py — Deterministic DCF valuation engines.
 Implements:
   - Gordon Growth Model (single-stage, for stable dividend-paying firms)
   - FCFF Multi-Stage DCF (high-growth + stable terminal phase)
+  - DDM Multi-Stage (Dividend Discount Model, for financial firms)
 
 No LLM calls. No consensus estimates. All inputs must be supplied by caller.
 
@@ -379,4 +380,117 @@ def fcff_valuation(
         "yearly_fcff": yearly_fcff,
         "yearly_pv": yearly_pv,
         "yearly_ebit_at": yearly_ebit_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DDM — Dividend Discount Model (for financial firms)
+# ---------------------------------------------------------------------------
+
+def ddm_valuation(
+    current_eps: float,
+    growth_rates: List[float],
+    payout_rates: List[float],
+    cost_of_equities: List[float],
+    stable_growth: float,
+    stable_roe: float,
+    stable_ke: float,
+) -> dict:
+    """
+    Perform a multi-stage Dividend Discount Model (DDM) valuation.
+
+    Appropriate for financial firms (banks, brokerages, insurance) where debt
+    is a raw material and FCFF is not meaningful. Equity is valued directly
+    via dividends paid to shareholders.
+
+    Steps:
+      1. Project EPS forward: eps_t = eps_{t-1} * (1 + g_t)
+      2. Compute DPS for each year: dps_t = eps_t * payout_t
+      3. Discount dividends to present using cumulative cost of equity
+      4. Terminal price (Gordon Growth on stable EPS):
+             stable_payout = 1 - stable_growth / stable_roe
+             terminal_price = EPS_n * (1 + stable_growth) * stable_payout
+                              / (stable_ke - stable_growth)
+      5. PV of terminal price = terminal_price / cumulative_discount_n
+      6. Value per share = sum(PV_dividends) + PV_terminal
+
+    Parameters
+    ----------
+    current_eps : float
+        Trailing earnings per share (EPS0).
+    growth_rates : list of float
+        Year-by-year EPS growth rates (length = n).
+    payout_rates : list of float
+        Year-by-year dividend payout ratios as a decimal (length = n).
+    cost_of_equities : list of float
+        Year-by-year cost of equity for discounting (length = n).
+    stable_growth : float
+        Perpetual EPS growth rate in the stable phase.
+    stable_roe : float
+        Return on equity in the stable phase (used to derive stable payout).
+    stable_ke : float
+        Cost of equity in the stable phase.
+
+    Returns
+    -------
+    dict with keys:
+        value_per_share : float — intrinsic equity value per share
+        pv_dividends    : float — sum of PV of explicit-period dividends
+        pv_terminal     : float — PV of the terminal price
+        terminal_price  : float — undiscounted terminal price at end of year n
+        yearly_eps      : list[float] — projected EPS for each year
+        yearly_dps      : list[float] — projected DPS for each year
+        yearly_pv       : list[float] — PV of DPS for each year
+
+    Raises
+    ------
+    ValueError
+        If stable_ke <= stable_growth (terminal price undefined / negative).
+        If growth_rates, payout_rates, and cost_of_equities differ in length.
+    """
+    n = len(growth_rates)
+    if len(payout_rates) != n or len(cost_of_equities) != n:
+        raise ValueError(
+            "growth_rates, payout_rates, and cost_of_equities must all have the same length. "
+            f"Got lengths: {n}, {len(payout_rates)}, {len(cost_of_equities)}."
+        )
+    if stable_ke <= stable_growth:
+        raise ValueError(
+            f"stable_ke ({stable_ke:.4f}) must be strictly greater than "
+            f"stable_growth ({stable_growth:.4f}) for a finite terminal price."
+        )
+
+    # Step 1 & 2: Project EPS and compute DPS
+    yearly_eps: List[float] = []
+    yearly_dps: List[float] = []
+    eps = current_eps
+    for g, payout in zip(growth_rates, payout_rates):
+        eps = eps * (1.0 + g)
+        yearly_eps.append(eps)
+        yearly_dps.append(eps * payout)
+
+    # Step 3: Discount dividends using cumulative cost of equity
+    yearly_pv = discount_cashflows(yearly_dps, cost_of_equities)
+    pv_dividends = sum(yearly_pv)
+
+    # Step 4: Terminal price at end of year n
+    final_eps = yearly_eps[-1] if yearly_eps else current_eps
+    stable_payout = 1.0 - stable_growth / stable_roe
+    terminal_price = final_eps * (1.0 + stable_growth) * stable_payout / (stable_ke - stable_growth)
+
+    # Step 5: Discount terminal price through cumulative Ke at year n
+    cumulative_discount_n = math.prod(1.0 + ke for ke in cost_of_equities) if cost_of_equities else 1.0
+    pv_terminal = terminal_price / cumulative_discount_n
+
+    # Step 6: Total equity value per share
+    value_per_share = pv_dividends + pv_terminal
+
+    return {
+        "value_per_share": value_per_share,
+        "pv_dividends": pv_dividends,
+        "pv_terminal": pv_terminal,
+        "terminal_price": terminal_price,
+        "yearly_eps": yearly_eps,
+        "yearly_dps": yearly_dps,
+        "yearly_pv": yearly_pv,
     }

@@ -17,6 +17,7 @@ from valuation.engines.dcf import (
     discount_cashflows,
     interpolate_params,
     fcff_valuation,
+    ddm_valuation,
 )
 
 
@@ -374,3 +375,55 @@ class TestFcffValuation:
         assert result["terminal_value"] > 0
         # For a growing firm, terminal value PV typically exceeds sum of explicit FCFFs
         assert result["pv_terminal"] > result["pv_high_growth"]
+
+
+# ---------------------------------------------------------------------------
+# DDM — Dividend Discount Model
+# ---------------------------------------------------------------------------
+
+class TestDDM:
+    def test_goldman_valuation(self):
+        # Goldman: EPS=16.77, ROE=13.19%, Ke HG=10.4%, 10yr, gradual
+        # stable: g=4%, ROE=10%, Ke=9.5%, payout ramps 8.35%→60%
+        growth_rates = interpolate_params(0.1209, 0.04, 10, gradual=True)
+        payout_rates = interpolate_params(0.0835, 0.60, 10, gradual=True)
+        ke_rates = interpolate_params(0.104, 0.095, 10, gradual=True)
+        result = ddm_valuation(
+            current_eps=16.77, growth_rates=growth_rates,
+            payout_rates=payout_rates, cost_of_equities=ke_rates,
+            stable_growth=0.04, stable_roe=0.10, stable_ke=0.095,
+        )
+        # Damodaran gets $222.49 — within 10%
+        assert abs(result["value_per_share"] - 222.49) < 22.0
+
+    def test_wellsfargo_valuation(self):
+        # Wells Fargo: EPS=2.16, ROE=13.5%, Ke=9.6%, 5yr
+        # stable: g=3%, ROE=7.6%, Ke=7.6%
+        growth_rates = interpolate_params(0.061, 0.03, 5, gradual=True)
+        payout_rates = interpolate_params(0.546, 0.605, 5, gradual=True)
+        ke_rates = interpolate_params(0.096, 0.076, 5, gradual=True)
+        result = ddm_valuation(
+            current_eps=2.16, growth_rates=growth_rates,
+            payout_rates=payout_rates, cost_of_equities=ke_rates,
+            stable_growth=0.03, stable_roe=0.076, stable_ke=0.076,
+        )
+        # Damodaran gets $30.28 — within $5
+        assert abs(result["value_per_share"] - 30.28) < 5.0
+
+    def test_ddm_simple(self):
+        result = ddm_valuation(
+            current_eps=10.0, growth_rates=[0.05, 0.05],
+            payout_rates=[0.50, 0.50], cost_of_equities=[0.10, 0.10],
+            stable_growth=0.03, stable_roe=0.10, stable_ke=0.10,
+        )
+        assert result["value_per_share"] > 0
+        assert result["pv_dividends"] > 0
+        assert result["pv_terminal"] > 0
+
+    def test_ddm_ke_below_growth_raises(self):
+        with pytest.raises(ValueError):
+            ddm_valuation(
+                current_eps=10.0, growth_rates=[0.05],
+                payout_rates=[0.50], cost_of_equities=[0.10],
+                stable_growth=0.06, stable_roe=0.10, stable_ke=0.05,
+            )
