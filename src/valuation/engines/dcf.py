@@ -16,6 +16,8 @@ from __future__ import annotations
 import math
 from typing import Callable, List
 
+from valuation.engines.schedules import reinvestment_s2c
+
 
 # ---------------------------------------------------------------------------
 # Gordon Growth Model
@@ -493,6 +495,182 @@ def ddm_valuation(
         "yearly_eps": yearly_eps,
         "yearly_dps": yearly_dps,
         "yearly_pv": yearly_pv,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Revenue-Based FCFF Valuation (v2) — Damodaran new-style spreadsheets
+# ---------------------------------------------------------------------------
+
+def fcff_valuation_v2(
+    base_revenue: float,
+    base_ebit: float,
+    revenue_growth_rates: list[float],
+    operating_margins: list[float],
+    tax_rates: list[float],
+    waccs: list[float],
+    sales_to_capital: float,
+    stable_growth: float,
+    stable_roc: float,
+    stable_wacc: float,
+    stable_tax_rate: float,
+    cash: float = 0.0,
+    debt: float = 0.0,
+    non_operating_assets: float = 0.0,
+    minority_interests: float = 0.0,
+    options_value: float = 0.0,
+    shares_outstanding: float = 1.0,
+    rd_adjustment: float = 0.0,
+    research_asset: float = 0.0,
+    base_invested_capital: float = 0.0,
+) -> dict:
+    """Revenue-based FCFF DCF with Damodaran-style transitions.
+
+    Key differences from fcff_valuation:
+    - Revenue-driven projections (not EBIT-driven)
+    - Operating margin convergence
+    - Sales-to-capital reinvestment
+    - Per-year WACC and tax rate (supports transitions)
+    - R&D adjustment to base EBIT and invested capital
+    - Tracks invested capital and ROIC
+
+    Parameters
+    ----------
+    base_revenue : float
+        Trailing twelve-month revenue (year 0).
+    base_ebit : float
+        Trailing EBIT before R&D adjustment (year 0).
+    revenue_growth_rates : list of float
+        Year-by-year revenue growth rates (length = n).
+    operating_margins : list of float
+        Year-by-year operating margins (length = n).
+    tax_rates : list of float
+        Year-by-year tax rates (length = n).
+    waccs : list of float
+        Year-by-year WACCs (length = n).
+    sales_to_capital : float
+        Sales-to-capital ratio for reinvestment calculation.
+    stable_growth : float
+        Terminal perpetual growth rate.
+    stable_roc : float
+        Terminal return on capital.
+    stable_wacc : float
+        Terminal WACC.
+    stable_tax_rate : float
+        Terminal marginal tax rate.
+    cash : float
+        Cash and near-cash assets.
+    debt : float
+        Market value of debt.
+    non_operating_assets : float
+        Non-operating assets (cross-holdings, etc.).
+    minority_interests : float
+        Minority interests (subtracted from equity).
+    options_value : float
+        Value of employee stock options (subtracted from equity).
+    shares_outstanding : float
+        Diluted shares outstanding.
+    rd_adjustment : float
+        EBIT adjustment from R&D capitalization (current_rd - amortization).
+    research_asset : float
+        Total unamortized R&D asset (added to invested capital).
+    base_invested_capital : float
+        Book equity + book debt - cash (before R&D adjustment).
+
+    Returns
+    -------
+    dict
+        Comprehensive valuation output including yearly projections.
+
+    Raises
+    ------
+    ValueError
+        If stable_wacc <= stable_growth.
+    """
+    n = len(revenue_growth_rates)
+
+    # Adjust base EBIT for R&D if applicable
+    adjusted_base_ebit = base_ebit + rd_adjustment
+
+    # Track invested capital
+    invested_capital = base_invested_capital + research_asset
+    if invested_capital <= 0:
+        invested_capital = base_revenue / sales_to_capital if sales_to_capital > 0 else base_revenue
+
+    # Project year by year
+    revenue = base_revenue
+    yearly_revenue: List[float] = []
+    yearly_ebit: List[float] = []
+    yearly_ebit_at: List[float] = []
+    yearly_reinvestment: List[float] = []
+    yearly_fcff: List[float] = []
+    yearly_ic: List[float] = []
+    yearly_roic: List[float] = []
+
+    for t in range(n):
+        prev_revenue = revenue
+        revenue = revenue * (1 + revenue_growth_rates[t])
+        ebit = revenue * operating_margins[t]
+        ebit_at = ebit * (1 - tax_rates[t])
+        reinvestment = reinvestment_s2c(prev_revenue, revenue, sales_to_capital)
+        fcff = ebit_at - reinvestment
+
+        roic = ebit_at / invested_capital if invested_capital > 0 else 0
+        invested_capital = invested_capital + reinvestment
+
+        yearly_revenue.append(revenue)
+        yearly_ebit.append(ebit)
+        yearly_ebit_at.append(ebit_at)
+        yearly_reinvestment.append(reinvestment)
+        yearly_fcff.append(fcff)
+        yearly_ic.append(invested_capital)
+        yearly_roic.append(roic)
+
+    # Discount FCFFs
+    yearly_pv = discount_cashflows(yearly_fcff, waccs)
+    pv_high_growth = sum(yearly_pv)
+
+    # Terminal value
+    terminal_ebit_at = yearly_ebit_at[-1] * (1 + stable_growth)
+    terminal_reinvestment_rate = stable_growth / stable_roc if stable_roc > 0 else 0
+    terminal_fcff = terminal_ebit_at * (1 - terminal_reinvestment_rate)
+
+    if stable_wacc <= stable_growth:
+        raise ValueError(f"stable_wacc ({stable_wacc}) must exceed stable_growth ({stable_growth})")
+
+    terminal_value = terminal_fcff / (stable_wacc - stable_growth)
+
+    # Discount terminal value
+    cumulative_discount = 1.0
+    for w in waccs:
+        cumulative_discount *= (1 + w)
+    pv_terminal = terminal_value / cumulative_discount
+
+    # Enterprise value
+    enterprise_value = pv_high_growth + pv_terminal
+
+    # Bridge to equity
+    equity_value = enterprise_value + cash - debt + non_operating_assets - minority_interests - options_value
+    equity_value_per_share = equity_value / shares_outstanding if shares_outstanding > 0 else 0
+
+    return {
+        "enterprise_value": enterprise_value,
+        "equity_value": equity_value,
+        "equity_value_per_share": equity_value_per_share,
+        "pv_high_growth": pv_high_growth,
+        "pv_terminal": pv_terminal,
+        "terminal_value": terminal_value,
+        "terminal_fcff": terminal_fcff,
+        "yearly_revenue": yearly_revenue,
+        "yearly_ebit": yearly_ebit,
+        "yearly_ebit_at": yearly_ebit_at,
+        "yearly_reinvestment": yearly_reinvestment,
+        "yearly_fcff": yearly_fcff,
+        "yearly_pv": yearly_pv,
+        "yearly_ic": yearly_ic,
+        "yearly_roic": yearly_roic,
+        "rd_adjustment": rd_adjustment,
+        "research_asset": research_asset,
     }
 
 
