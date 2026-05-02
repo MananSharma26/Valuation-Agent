@@ -27,9 +27,14 @@ from valuation.agents.risk_assessor import (
 )
 from valuation.agents.growth_estimator import estimate_all_growth_rates
 from valuation.engines.dcf import (
-    fcff_valuation, ddm_valuation, gordon_growth_value,
+    fcff_valuation, fcff_valuation_v2, ddm_valuation, gordon_growth_value,
     interpolate_params, sensitivity_table, two_way_sensitivity_table,
 )
+from valuation.engines.schedules import (
+    wacc_schedule, tax_schedule, margin_convergence_schedule,
+    terminal_wacc_default,
+)
+from valuation.engines.adjustments import capitalize_rd, get_amortization_period
 from valuation.engines.relative import relative_valuation
 from valuation.engines.excess_returns import excess_return_valuation
 from valuation.agents.cross_validator import cross_validate
@@ -309,23 +314,78 @@ def run(ticker: str, growth_override: float | None = None,
         ctx.outputs.excess_returns = er_result
         print(f"  [Excess Returns] Value/Share: {er_result['value_per_share']:,.2f}")
     else:
-        # FCFF for non-financial
-        actual_reinv = (capex - depr) / ebit_at if ebit_at > 0 else 0.3
-        actual_reinv = max(actual_reinv, -0.15)
-        stable_roc = 0.15
-        reinv_stable = terminal_growth / stable_roc
-        reinv_rates = interpolate_params(actual_reinv, reinv_stable, n_years, gradual=True)
+        # FCFF v2 — revenue-based with Damodaran transitions
+        # R&D capitalization
+        rd_adj = 0.0
+        research_asset = 0.0
+        rd_col = None
+        for col in inc.columns:
+            if 'research' in col.lower() and 'development' in col.lower():
+                rd_col = col
+                break
+        if rd_col:
+            current_rd = abs(float(latest_inc.get(rd_col, 0) or 0))
+            if current_rd > 0:
+                past_rd = []
+                for i in range(1, min(len(inc), 6)):
+                    val = abs(float(inc.iloc[i].get(rd_col, 0) or 0))
+                    if val > 0:
+                        past_rd.append(val)
+                amort_years = get_amortization_period(ctx.company.damodaran_industry or "")
+                rd_result = capitalize_rd(current_rd, past_rd, amort_years)
+                rd_adj = rd_result["ebit_adjustment"]
+                research_asset = rd_result["research_asset"]
+                print(f"  [R&D Cap] Current R&D: {current_rd:,.0f} | Asset: {research_asset:,.0f} | EBIT adj: +{rd_adj:,.0f}")
 
-        fcff_result = fcff_valuation(
-            current_ebit_after_tax=ebit_at,
-            growth_rates=growth_rates, reinvestment_rates=reinv_rates,
-            waccs=[wacc] * n_years,
-            stable_growth=terminal_growth, stable_roc=stable_roc, stable_wacc=wacc,
-            cash=cash, debt=total_debt,
+        # Terminal WACC (Damodaran: Rf + 4.5% + CRP)
+        t_wacc = terminal_wacc_default(rf, crp if crp else 0.0)
+        # Allow override if user specified stable WACC lower
+        stable_roc = 0.20  # competitive advantage persists for quality companies
+
+        # Generate Damodaran-style schedules
+        wacc_sched = wacc_schedule(wacc, t_wacc, n_years, n_constant=5)
+        tax_sched = tax_schedule(tax_rate, 0.25, n_years, n_constant=5)
+
+        # Operating margin convergence
+        current_margin = ebit / revenue if revenue > 0 else 0.15
+        target_margin = min(current_margin, 0.60)  # cap at 60% (Damodaran Nvidia convention)
+        if current_margin < 0.15:
+            target_margin = max(current_margin, ctx.benchmarks.industry_margins.get("operating_margin", 0.15) or 0.15)
+        margin_sched = margin_convergence_schedule(current_margin, target_margin, convergence_year=5, n_years=n_years)
+
+        # Sales-to-capital ratio from financials
+        total_assets = float(latest_bs.get('Total Assets', 0) or 0)
+        invested_capital = total_assets - cash + research_asset
+        s2c = revenue / invested_capital if invested_capital > 0 else 2.5
+        s2c = max(min(s2c, 10.0), 0.5)  # bound
+
+        print(f"  [Schedules] WACC: {wacc:.2%} → {t_wacc:.2%} | Tax: {tax_rate:.1%} → 25%")
+        print(f"  [Schedules] Margin: {current_margin:.1%} → {target_margin:.1%} | S2C: {s2c:.2f}")
+
+        fcff_result = fcff_valuation_v2(
+            base_revenue=revenue,
+            base_ebit=ebit,
+            revenue_growth_rates=growth_rates,
+            operating_margins=margin_sched,
+            tax_rates=tax_sched,
+            waccs=wacc_sched,
+            sales_to_capital=s2c,
+            stable_growth=terminal_growth,
+            stable_roc=stable_roc,
+            stable_wacc=t_wacc,
+            stable_tax_rate=0.25,
+            cash=cash,
+            debt=total_debt,
+            non_operating_assets=0.0,
+            minority_interests=0.0,
+            options_value=0.0,
             shares_outstanding=data.shares_outstanding,
+            rd_adjustment=rd_adj,
+            research_asset=research_asset,
+            base_invested_capital=invested_capital,
         )
         ctx.outputs.dcf_fcff = fcff_result
-        print(f"  [FCFF DCF] Value/Share: {fcff_result['equity_value_per_share']:,.2f}")
+        print(f"  [FCFF DCF v2] Value/Share: {fcff_result['equity_value_per_share']:,.2f}")
         print(f"    EV: {fcff_result['enterprise_value']:,.0f} | PV HG: {fcff_result['pv_high_growth']:,.0f} | PV TV: {fcff_result['pv_terminal']:,.0f}")
 
     # Relative valuation (always run)
@@ -352,35 +412,50 @@ def run(ticker: str, growth_override: float | None = None,
     # STEP 9: Sensitivity Analysis
     # ================================================================
     print(f"\n--- Step 9: Sensitivity Analysis ---")
-    if ctx.outputs.dcf_fcff:
+    if ctx.outputs.dcf_fcff and ctx.company.classification != "financial":
         base_params = dict(
-            current_ebit_after_tax=ebit_at,
-            growth_rates=growth_rates, reinvestment_rates=reinv_rates,
-            waccs=[wacc] * n_years,
-            stable_growth=terminal_growth, stable_roc=stable_roc, stable_wacc=wacc,
+            base_revenue=revenue,
+            base_ebit=ebit,
+            revenue_growth_rates=growth_rates,
+            operating_margins=margin_sched,
+            tax_rates=tax_sched,
+            waccs=wacc_sched,
+            sales_to_capital=s2c,
+            stable_growth=terminal_growth,
+            stable_roc=stable_roc,
+            stable_wacc=t_wacc,
+            stable_tax_rate=0.25,
             cash=cash, debt=total_debt,
             shares_outstanding=data.shares_outstanding,
+            rd_adjustment=rd_adj,
+            research_asset=research_asset,
+            base_invested_capital=invested_capital,
         )
-        extract_fn = lambda **kw: fcff_valuation(**kw)["equity_value_per_share"]
+        extract_fn = lambda **kw: fcff_valuation_v2(**kw)["equity_value_per_share"]
 
-        # One-way: WACC
-        wacc_values = [wacc - 0.02, wacc - 0.01, wacc, wacc + 0.01, wacc + 0.02]
+        # One-way: vary terminal WACC (which drives the schedule)
+        base_t_wacc = t_wacc if ctx.company.classification != "financial" else wacc
+        wacc_offsets = [-0.02, -0.01, 0, 0.01, 0.02]
         wacc_sens = {}
-        for w_val in wacc_values:
+        for offset in wacc_offsets:
+            w_val = base_t_wacc + offset
             try:
-                p = {**base_params, "waccs": [w_val] * n_years, "stable_wacc": w_val}
+                new_sched = wacc_schedule(wacc + offset, w_val, n_years, n_constant=5)
+                p = {**base_params, "waccs": new_sched, "stable_wacc": w_val}
                 wacc_sens[round(w_val, 4)] = extract_fn(**p)
             except (ValueError, ZeroDivisionError):
                 wacc_sens[round(w_val, 4)] = float("nan")
 
-        # Two-way: WACC vs terminal growth
+        # Two-way: terminal WACC vs terminal growth
         tg_values = [terminal_growth - 0.02, terminal_growth - 0.01, terminal_growth, terminal_growth + 0.01]
         two_way = {}
-        for w_val in wacc_values:
+        for offset in wacc_offsets:
+            w_val = base_t_wacc + offset
             two_way[round(w_val, 4)] = {}
             for tg_val in tg_values:
                 try:
-                    p = {**base_params, "waccs": [w_val] * n_years, "stable_wacc": w_val, "stable_growth": tg_val}
+                    new_sched = wacc_schedule(wacc + offset, w_val, n_years, n_constant=5)
+                    p = {**base_params, "waccs": new_sched, "stable_wacc": w_val, "stable_growth": tg_val}
                     two_way[round(w_val, 4)][round(tg_val, 4)] = extract_fn(**p)
                 except (ValueError, ZeroDivisionError):
                     two_way[round(w_val, 4)][round(tg_val, 4)] = float("nan")
