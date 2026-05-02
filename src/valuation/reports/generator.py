@@ -10,9 +10,15 @@ Methodology: Damodaran (Investment Valuation, 3rd ed.)
 
 from __future__ import annotations
 
+import json
+import pathlib
+from datetime import date
 from typing import Any
 
 from valuation.context import ValuationContext
+
+# Default reports directory (project root / reports)
+_REPORTS_DIR = pathlib.Path(__file__).parent.parent.parent.parent / "reports"
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +53,70 @@ def generate_report(ctx: ValuationContext) -> str:
     # Filter out empty sections (returns empty string when data is absent)
     body = "\n\n---\n\n".join(s for s in sections if s.strip())
     return body + "\n"
+
+
+def save_report(ctx: ValuationContext, reports_dir: str | pathlib.Path | None = None) -> pathlib.Path:
+    """Generate and save a valuation report + JSON summary to disk.
+
+    Creates: reports/<CompanyName>/YYYY-MM-DD_<TICKER>.md
+             reports/<CompanyName>/YYYY-MM-DD_<TICKER>.json
+
+    Args:
+        ctx: Completed ValuationContext
+        reports_dir: Override reports directory (default: project root / reports)
+
+    Returns:
+        Path to the saved markdown report
+    """
+    base = pathlib.Path(reports_dir) if reports_dir else _REPORTS_DIR
+    company_name = (ctx.company.name or ctx.company.ticker).replace("/", "-").replace("\\", "-")
+    company_dir = base / company_name
+    company_dir.mkdir(parents=True, exist_ok=True)
+
+    today = date.today().isoformat()
+    ticker = ctx.company.ticker.replace(":", "-")
+    md_path = company_dir / f"{today}_{ticker}.md"
+    json_path = company_dir / f"{today}_{ticker}.json"
+
+    # Save markdown report
+    report = generate_report(ctx)
+    md_path.write_text(report, encoding="utf-8")
+
+    # Save JSON summary
+    summary = ctx.to_summary_dict()
+    # Add full outputs for programmatic use
+    summary["outputs"] = {
+        "dcf_fcff": ctx.outputs.dcf_fcff,
+        "dcf_fcfe": ctx.outputs.dcf_fcfe,
+        "relative": ctx.outputs.relative,
+        "excess_returns": ctx.outputs.excess_returns,
+        "sensitivity": ctx.outputs.sensitivity,
+    }
+    summary["assumptions"] = {
+        "risk_free_rate": ctx.assumptions.risk_free_rate,
+        "erp": ctx.assumptions.erp,
+        "country_risk_premium": ctx.assumptions.country_risk_premium,
+        "beta": ctx.assumptions.beta,
+        "cost_of_equity": ctx.assumptions.cost_of_equity,
+        "cost_of_debt": ctx.assumptions.cost_of_debt,
+        "wacc": ctx.assumptions.wacc,
+        "growth_rates": ctx.assumptions.growth_rates,
+        "terminal_growth": ctx.assumptions.terminal_growth,
+        "tax_rate": ctx.assumptions.tax_rate,
+    }
+    summary["confidence"] = {
+        "data_completeness": ctx.confidence.data_completeness,
+        "model_agreement": ctx.confidence.model_agreement,
+        "assumption_sensitivity": ctx.confidence.assumption_sensitivity,
+        "industry_coverage": ctx.confidence.industry_coverage,
+        "composite": ctx.confidence.composite,
+        "flags": ctx.confidence.flags,
+    }
+    summary["date"] = today
+
+    json_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+
+    return md_path
 
 
 # ---------------------------------------------------------------------------
