@@ -1,12 +1,31 @@
 # Valuation Agent v1 -- Claude Code Orchestrator Instructions
 
+## Quick Start
+
+When a user says **"Value \<TICKER\>"**, run the full pipeline:
+
+```bash
+python3 run_valuation.py <TICKER>
+```
+
+Examples:
+```bash
+python3 run_valuation.py TATAELXSI.NS                          # auto everything
+python3 run_valuation.py AAPL --growth 0.12 --terminal 0.025    # with overrides
+python3 run_valuation.py HDFCBANK.NS --classification financial # force financial model
+```
+
+This runs ALL 13 steps, fetches analyst consensus from I/B/E/S, runs sensitivity tables, and saves both markdown + Excel reports to `reports/<CompanyName>/`.
+
+For interactive overrides, present assumptions first (see Step 7 below), then rerun with `--growth`, `--terminal`, or `--classification` flags.
+
 ## Project Overview
 
 This is a **multi-agent valuation system** that values public companies using Damodaran methodology. Claude Code is the orchestrator: it calls deterministic Python modules for all financial math, interprets results, proposes assumptions to the user, handles overrides, and assembles a final report.
 
 **Architecture:** Claude Code (LLM orchestrator) + Python engines (deterministic math)
-**Data sources:** Yahoo Finance (company data) + Damodaran Excel files (industry benchmarks)
-**Damodaran data path:** `../2. Damodaran_Data/`
+**Data sources:** Yahoo Finance (company data) + Damodaran Excel files (industry benchmarks) + WRDS (Compustat + I/B/E/S for comparison)
+**Damodaran data path:** `data/damodaran/` or `../2. Damodaran_Data/`
 
 ---
 
