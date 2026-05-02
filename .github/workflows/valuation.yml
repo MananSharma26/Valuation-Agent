@@ -1,0 +1,304 @@
+name: Run Valuation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: 'Stock ticker (e.g., AAPL, TCS.NS, MSFT)'
+        required: true
+        type: string
+      growth_rate:
+        description: 'High-growth rate override (e.g., 0.12 for 12%). Leave empty for auto.'
+        required: false
+        type: string
+      terminal_growth:
+        description: 'Terminal growth rate (default: 0.025 for US, 0.05 for India)'
+        required: false
+        type: string
+      classification:
+        description: 'Override classification (mature/growth/financial/distressed/cyclical)'
+        required: false
+        type: string
+
+jobs:
+  valuate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          pip install wrds
+
+      - name: Set up WRDS credentials
+        run: |
+          echo "${{ secrets.WRDS_PGPASS }}" > ~/.pgpass
+          chmod 600 ~/.pgpass
+
+      - name: Fetch company data
+        id: fetch
+        run: |
+          python3 -c "
+          from valuation.data.api_client import fetch_financials
+          data = fetch_financials('${{ inputs.ticker }}')
+          if data is None:
+              print('::error::Failed to fetch data for ${{ inputs.ticker }}')
+              exit(1)
+          print(f'::notice::Company: {data.name}')
+          print(f'::notice::Sector: {data.sector} | Industry: {data.industry}')
+          print(f'::notice::Price: {data.price} | Market Cap: {data.market_cap:,.0f}')
+          print(f'::notice::Country: {data.country}')
+          "
+
+      - name: Run full valuation
+        run: |
+          python3 << 'PYEOF'
+          import sys, json, pathlib
+          from valuation.data.api_client import fetch_financials
+          from valuation.data.normalizer import normalize
+          from valuation.data.damodaran_loader import DamodaranLoader
+          from valuation.agents.industry_mapper import match_industry, load_industry_benchmarks
+          from valuation.agents.classifier import classify_company
+          from valuation.agents.risk_assessor import compute_cost_of_equity, compute_wacc, relever_beta, get_synthetic_rating
+          from valuation.agents.growth_estimator import estimate_all_growth_rates
+          from valuation.engines.dcf import fcff_valuation, ddm_valuation, interpolate_params
+          from valuation.engines.relative import relative_valuation
+          from valuation.agents.cross_validator import cross_validate
+          from valuation.scoring.confidence import score_all
+          from valuation.reports.generator import generate_report, save_report
+          from valuation.validation.pre_engine import validate_for_dcf
+
+          ticker = "${{ inputs.ticker }}"
+          growth_override = "${{ inputs.growth_rate }}" or None
+          terminal_override = "${{ inputs.terminal_growth }}" or None
+          class_override = "${{ inputs.classification }}" or None
+
+          print(f"::group::Step 1 - Fetch Data")
+          data = fetch_financials(ticker)
+          if data is None:
+              print(f"::error::Cannot fetch {ticker}")
+              sys.exit(1)
+          ctx = normalize(data)
+          print(f"Company: {data.name}")
+          print(f"Sector: {data.sector} | Industry: {data.industry}")
+          print(f"Country: {data.country} | Price: {data.price}")
+          print(f"Market Cap: {data.market_cap:,.0f}")
+          print(f"Income Statement: {data.income_statement.shape}")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 2 - Classify Company")
+          cl = classify_company(ctx)
+          if class_override:
+              ctx.company.classification = class_override
+              print(f"Classification overridden to: {class_override}")
+          else:
+              ctx.company.classification = cl.classification
+          print(f"Classification: {ctx.company.classification} ({cl.confidence:.0%})")
+          print(f"Reasoning: {cl.reasoning}")
+          print(f"Suggested model: {cl.suggested_model}")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 3 - Map Industry")
+          loader = DamodaranLoader("data/damodaran")
+          match = match_industry(ctx.company.sector or "", data.industry or "", data.name or "", loader, ctx.company.region)
+          if match:
+              ctx.company.damodaran_industry = match.matched_name
+              bm = load_industry_benchmarks(match.matched_name, loader, ctx.company.region)
+              if bm:
+                  ctx.benchmarks.industry_beta = bm["beta"]
+                  ctx.benchmarks.industry_unlevered_beta = bm["unlevered_beta"]
+                  ctx.benchmarks.industry_de_ratio = bm["de_ratio"]
+                  ctx.benchmarks.industry_wacc = bm["wacc"]
+                  ctx.benchmarks.industry_multiples = bm["multiples"]
+                  ctx.benchmarks.industry_margins = bm["margins"]
+                  ctx.benchmarks.industry_growth = bm["growth"]
+              print(f"Industry: {match.matched_name} (score {match.score})")
+              print(f"Industry beta: {bm['beta']:.2f}, WACC: {bm['wacc']:.2%}")
+          else:
+              print("::warning::Industry match failed")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 4 - Risk Assessment")
+          inc = ctx.financials.income_statement
+          bs = ctx.financials.balance_sheet
+          cf = ctx.financials.cash_flow
+          latest_inc = inc.iloc[0]
+          latest_bs = bs.iloc[0]
+
+          total_debt = float(latest_bs.get('Total Debt', 0) or 0)
+          market_cap = data.market_cap
+          company_de = total_debt / market_cap if market_cap > 0 else 0
+
+          tax_prov = float(latest_inc.get('Tax Provision', 0) or 0)
+          pretax = float(latest_inc.get('Pretax Income', 0) or 0)
+          tax_rate = tax_prov / pretax if pretax > 0 else 0.25
+
+          ebit = float(latest_inc.get('Operating Income', 0) or 0)
+          interest = float(latest_inc.get('Interest Expense', 0) or 0)
+          icr = ebit / interest if interest > 0 else 50
+
+          beta = relever_beta(ctx.benchmarks.industry_unlevered_beta, company_de, tax_rate)
+
+          # Determine risk-free rate by region
+          is_india = ctx.company.region == "India"
+          rf = 0.07 if is_india else 0.0395
+          erp = 0.0446
+          crp = 0.0
+          lam = 0.5 if is_india else 1.0
+
+          ke = compute_cost_of_equity(rf, beta, erp, crp, lam)
+          rating, spread = get_synthetic_rating(icr, "large")
+          cod = rf + spread
+          eq_w = market_cap / (market_cap + total_debt)
+          wacc = compute_wacc(ke, cod, tax_rate, eq_w, 1 - eq_w)
+
+          ctx.assumptions.beta = beta
+          ctx.assumptions.risk_free_rate = rf
+          ctx.assumptions.erp = erp
+          ctx.assumptions.country_risk_premium = crp
+          ctx.assumptions.cost_of_equity = ke
+          ctx.assumptions.cost_of_debt = cod
+          ctx.assumptions.wacc = wacc
+          ctx.assumptions.tax_rate = tax_rate
+          ctx.financials.key_stats["shares_outstanding"] = data.shares_outstanding
+
+          print(f"Beta: {beta:.3f} | Ke: {ke:.2%} | WACC: {wacc:.2%}")
+          print(f"Rf: {rf:.2%} | ERP: {erp:.2%} | Rating: {rating}")
+          print(f"D/E: {company_de:.4f} | Tax: {tax_rate:.1%}")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 5 - Growth Estimation")
+          growth_dict = estimate_all_growth_rates(ctx)
+          for name, est in growth_dict.items():
+              if est:
+                  print(f"{name}: {est.value:.2%} -- {est.reasoning}")
+              else:
+                  print(f"{name}: N/A")
+
+          # Determine growth rate
+          n_years = 10
+          terminal_growth = float(terminal_override) if terminal_override else (0.05 if is_india else 0.025)
+
+          if growth_override:
+              high_growth = float(growth_override)
+          else:
+              rev_g = growth_dict.get("historical_revenue")
+              high_growth = rev_g.value if rev_g and rev_g.value > 0 else 0.08
+              high_growth = max(min(high_growth, 0.25), 0.03)
+
+          growth_rates = interpolate_params(high_growth, terminal_growth, n_years, gradual=True)
+          ctx.assumptions.growth_rates = growth_rates
+          ctx.assumptions.terminal_growth = terminal_growth
+          ctx.assumptions.projection_years = n_years
+
+          print(f"\nUsing: {high_growth:.2%} -> {terminal_growth:.2%} over {n_years} years")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 6 - DCF Valuation")
+          ebit_at = ebit * (1 - tax_rate)
+          capex = abs(float(cf.iloc[0].get('Capital Expenditure', 0) or 0)) if cf is not None and len(cf) > 0 else 0
+          depr = float(cf.iloc[0].get('Depreciation And Amortization', 0) or 0) if cf is not None and len(cf) > 0 else 0
+          actual_reinv = (capex - depr) / ebit_at if ebit_at > 0 else 0.3
+          actual_reinv = max(actual_reinv, -0.15)
+          stable_roc = 0.15
+          reinv_stable = terminal_growth / stable_roc
+          reinv_rates = interpolate_params(actual_reinv, reinv_stable, n_years, gradual=True)
+
+          cash = float(latest_bs.get('Cash And Cash Equivalents', 0) or 0)
+
+          if ctx.company.classification == "financial":
+              # DDM
+              net_income = float(latest_inc.get('Net Income', 0) or 0)
+              eps = net_income / data.shares_outstanding if data.shares_outstanding > 0 else 0
+              payout_rates = interpolate_params(0.30, 0.70, n_years, gradual=True)
+              ke_rates = [ke] * n_years
+              result = ddm_valuation(
+                  current_eps=eps, growth_rates=growth_rates,
+                  payout_rates=payout_rates, cost_of_equities=ke_rates,
+                  stable_growth=terminal_growth, stable_roe=0.12, stable_ke=ke,
+              )
+              ctx.outputs.dcf_fcfe = result
+              per_share = result["value_per_share"]
+              print(f"DDM Value/Share: {per_share:,.2f}")
+          else:
+              # FCFF
+              result = fcff_valuation(
+                  current_ebit_after_tax=ebit_at,
+                  growth_rates=growth_rates, reinvestment_rates=reinv_rates,
+                  waccs=[wacc] * n_years,
+                  stable_growth=terminal_growth, stable_roc=stable_roc, stable_wacc=wacc,
+                  cash=cash, debt=total_debt,
+                  shares_outstanding=data.shares_outstanding,
+              )
+              ctx.outputs.dcf_fcff = result
+              per_share = result["equity_value_per_share"]
+              print(f"Enterprise Value: {result['enterprise_value']:,.0f}")
+              print(f"Equity Value: {result['equity_value']:,.0f}")
+              print(f"Value/Share: {per_share:,.2f}")
+              print(f"PV High-Growth: {result['pv_high_growth']:,.0f}")
+              print(f"PV Terminal: {result['pv_terminal']:,.0f}")
+
+          print(f"Market Price: {data.price}")
+          upside = (per_share - data.price) / data.price * 100
+          print(f"Implied: {upside:+.1f}%")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 7 - Relative Valuation")
+          net_income = float(latest_inc.get('Net Income', 0) or 0)
+          ebitda = float(latest_inc.get('EBITDA', 0) or 0)
+          revenue = float(latest_inc.get('Total Revenue', 0) or 0)
+          eps = net_income / data.shares_outstanding if data.shares_outstanding > 0 else 0
+          rev_ps = revenue / data.shares_outstanding if data.shares_outstanding > 0 else 0
+
+          rel = relative_valuation(
+              eps=eps, ebitda=ebitda, book_value_per_share=data.book_value_per_share,
+              revenue_per_share=rev_ps, industry_multiples=ctx.benchmarks.industry_multiples,
+              debt=total_debt, cash=cash, shares_outstanding=data.shares_outstanding,
+              market_price=data.price,
+          )
+          ctx.outputs.relative = rel.to_dict()
+          if rel.pe_value: print(f"PE implied: {rel.pe_value:,.2f}")
+          if rel.ev_ebitda_value: print(f"EV/EBITDA implied: {rel.ev_ebitda_value:,.2f}")
+          if rel.pbv_value: print(f"PBV implied: {rel.pbv_value:,.2f}")
+          if rel.ps_value: print(f"PS implied: {rel.ps_value:,.2f}")
+          if rel.composite_value: print(f"Composite: {rel.composite_value:,.2f}")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 8 - Cross-Validation & Confidence")
+          outputs = {}
+          if ctx.outputs.dcf_fcff: outputs["dcf_fcff"] = ctx.outputs.dcf_fcff
+          if ctx.outputs.dcf_fcfe: outputs["dcf_fcfe"] = ctx.outputs.dcf_fcfe
+          if ctx.outputs.relative: outputs["relative"] = ctx.outputs.relative
+          cv = cross_validate(outputs, data.price)
+          print(f"Models: {cv.num_models} | Mean: {cv.mean_value:,.0f}" if cv.mean_value else "")
+          print(f"Divergence: {cv.max_divergence_pct:.1%}" if cv.max_divergence_pct else "")
+          for f in cv.flags:
+              print(f"FLAG: {f}")
+
+          score_all(ctx, industry_match_score=match.score if match else 0)
+          print(f"Confidence: {ctx.confidence.composite:.0%}" if ctx.confidence.composite else "")
+          for f in ctx.confidence.flags:
+              print(f"FLAG: {f}")
+          print(f"::endgroup::")
+
+          print(f"::group::Step 9 - Generate Report")
+          report_path = save_report(ctx)
+          print(f"Report saved: {report_path}")
+          report = generate_report(ctx)
+          print(report)
+          print(f"::endgroup::")
+          PYEOF
+
+      - name: Upload valuation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: valuation-${{ inputs.ticker }}-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
