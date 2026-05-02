@@ -231,9 +231,24 @@ ASSUMPTIONS FOR REVIEW:
   Projection Years: 10
 
   Tax Rate: 21.0%
-
-  Would you like to change any assumptions?
 ```
+
+**After the table, ask POINTED questions — not open-ended ones.**
+
+For each assumption where the computed value differs meaningfully from a
+benchmark or where confidence is low, ask a specific question that states the
+value, the reference, your recommendation, and a bracketed reply shorthand.
+Then close with ONE open-ended question.
+
+Example questions (adapt to the actual numbers):
+
+- "WACC is 8.23%. Industry average is 9.1%. Keep 8.23% or adjust? [keep / adjust to ___]"
+- "Beta: 1.15 (industry bottom-up, re-levered). Company beta from yfinance is 0.95. Use 1.15? [yes / use 0.95 / other]"
+- "Growth: fundamental ROE×retention gives 12.0%. Historical revenue CAGR is 8.4%. I recommend 12.0% given strong buyback program. Accept 12.0%? [yes / adjust to ___]"
+- "Terminal growth: 2.5% (US nominal GDP). Acceptable? [yes / adjust]"
+- "Any other adjustments before I run the engines?"
+
+**Never ask:** "Would you like to change any assumptions?" or "Any changes?" — these are too vague and not actionable.
 
 If the user overrides anything:
 ```python

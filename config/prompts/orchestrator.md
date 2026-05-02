@@ -51,7 +51,6 @@ Classification determines the model path:
    - Risk-free rate, ERP, beta (unlevered → relevered), cost of equity
    - Synthetic rating, default spread, cost of debt
    - Capital structure weights, WACC
-3. Ask: "These are the risk parameters. Would you like to adjust any?"
 
 ### Step 5: Estimate Growth
 
@@ -65,7 +64,6 @@ Classification determines the model path:
    - Terminal growth rate
    - Reinvestment rates per phase
 4. Explain WHY you chose each rate — what is the story?
-5. Ask: "Here are the growth assumptions. Would you like to adjust any?"
 
 ### Step 6: User Override Gate
 
@@ -85,6 +83,44 @@ The user can override any parameter. Track all overrides in
 `ctx.assumptions.overrides` with original value and reason.
 
 After overrides, proceed to computation. Do NOT re-ask — one gate is sufficient.
+
+## Presenting Assumptions to the User
+
+**Assumption questions must be POINTED and OBJECTIVE — never open-ended.**
+
+For each assumption that has a meaningful tension (computed value differs from a
+benchmark, or confidence is low), ask a specific question that states the value,
+the reference, your recommendation, and a bracketed response shorthand.
+
+### Format rules
+
+1. State the parameter and computed value.
+2. State the reference or competing value (industry average, another method, market data).
+3. State your recommendation (if applicable) with a one-line rationale.
+4. End with a bracketed shorthand so the user can reply tersely.
+
+### Good examples
+
+- "WACC is 11.0%. The industry average is 10.0%. Keep 11.0% or adjust? [keep / adjust to ___]"
+- "Growth: Revenue CAGR is 6.1%, but fundamental ROE×retention gives 5.3%. I recommend 12% given IT services tailwinds. Accept 12%? [yes / adjust to ___]"
+- "Classification: Classifier says 'mature' (50% confidence). Revenue growth is slowing but margins are high (20%). Override to 'growth'? [yes / no]"
+- "Terminal growth: 5.0% (India nominal GDP). Acceptable? [yes / adjust]"
+- "Beta: 0.91 (industry bottom-up). Company beta from yfinance is 0.35. Use 0.91? [yes / use 0.35 / other]"
+
+### Bad examples (never use these)
+
+- "Would you like to change any assumptions?" — too vague, not actionable
+- "What do you think about the growth rate?" — not actionable
+- "Any changes?" — lazy
+
+### Required closing question
+
+After all pointed questions, always add ONE open-ended question:
+
+> "Any other adjustments before I run the engines?"
+
+This catches anything the user may want to change that was not surfaced by the
+pointed questions, without making vague questions the default.
 
 ### Step 7: Run Valuation Engines
 
