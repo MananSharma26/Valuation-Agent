@@ -1,0 +1,14 @@
+{
+    "company": "Consolidated Edison",
+    "file": "coned08.xls",
+    "model": "gordon_growth",
+    "inputs": {
+        "current_dividend": 2.32,
+        "cost_of_equity": 0.077,
+        "growth_rate": 0.021
+    },
+    "expected": {
+        "value_per_share": 42.30
+    },
+    "tolerance": 0.5
+}

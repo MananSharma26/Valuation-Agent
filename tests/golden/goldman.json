@@ -1,0 +1,21 @@
+{
+    "company": "Goldman Sachs",
+    "file": "goldman.xls",
+    "model": "ddm",
+    "inputs": {
+        "current_eps": 16.77,
+        "high_growth_rate": 0.1209,
+        "stable_growth": 0.04,
+        "high_payout": 0.0835,
+        "stable_payout": 0.60,
+        "high_ke": 0.104,
+        "stable_ke": 0.095,
+        "stable_roe": 0.10,
+        "n_years": 10,
+        "gradual": true
+    },
+    "expected": {
+        "value_per_share": 222.49
+    },
+    "tolerance_pct": 0.10
+}

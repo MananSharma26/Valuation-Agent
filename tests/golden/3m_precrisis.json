@@ -1,0 +1,22 @@
+{
+    "company": "3M Pre-Crisis",
+    "file": "3Mprecrisis.xls",
+    "model": "fcff",
+    "inputs": {
+        "current_ebit_after_tax": 3585.5215340044533,
+        "growth_rates": [0.075, 0.075, 0.066, 0.048, 0.03],
+        "reinvestment_rates": [0.3, 0.3, 0.3287954891891492, 0.3863864675674476, 0.443977445945746],
+        "waccs": [0.08629369445006092, 0.08629369445006092, 0.08254915556004874, 0.07506007778002437, 0.06757099999999999],
+        "stable_growth": 0.03,
+        "stable_roc": 0.06757099999999999,
+        "stable_wacc": 0.06757099999999999,
+        "cash": 3253.0,
+        "debt": 5296.69117225974,
+        "options_value": 1215.7849253953716,
+        "shares_outstanding": 699.0
+    },
+    "expected": {
+        "value_per_share": 82.19
+    },
+    "tolerance_pct": 0.001
+}
