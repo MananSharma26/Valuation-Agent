@@ -18,6 +18,8 @@ from valuation.engines.dcf import (
     interpolate_params,
     fcff_valuation,
     ddm_valuation,
+    sensitivity_table,
+    two_way_sensitivity_table,
 )
 
 
@@ -427,3 +429,45 @@ class TestDDM:
                 payout_rates=[0.50], cost_of_equities=[0.10],
                 stable_growth=0.06, stable_roe=0.10, stable_ke=0.05,
             )
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity Table Generators
+# ---------------------------------------------------------------------------
+
+class TestSensitivity:
+    def test_gordon_one_way(self):
+        table = sensitivity_table(
+            base_params={"current_dividend": 2.32, "cost_of_equity": 0.077, "growth_rate": 0.021},
+            vary_param="growth_rate",
+            vary_values=[-0.01, 0.0, 0.01, 0.021, 0.03, 0.04],
+            valuation_fn=gordon_growth_value,
+        )
+        assert len(table) == 6
+        assert abs(table[0.021] - 42.30) < 0.5
+
+    def test_gordon_two_way(self):
+        table = two_way_sensitivity_table(
+            base_params={"current_dividend": 2.32, "cost_of_equity": 0.077, "growth_rate": 0.021},
+            row_param="growth_rate",
+            row_values=[0.01, 0.02, 0.03],
+            col_param="cost_of_equity",
+            col_values=[0.06, 0.07, 0.08],
+            valuation_fn=gordon_growth_value,
+        )
+        assert len(table) == 3
+        assert len(table[0.01]) == 3
+        # g=2%, ke=8% -> 2.32*1.02/(0.08-0.02) = 39.44
+        assert abs(table[0.02][0.08] - 39.44) < 0.5
+
+    def test_sensitivity_catches_errors(self):
+        table = sensitivity_table(
+            base_params={"current_dividend": 2.32, "cost_of_equity": 0.05, "growth_rate": 0.02},
+            vary_param="growth_rate",
+            vary_values=[0.02, 0.05, 0.06],  # 0.05 and 0.06 will error (g >= ke)
+            valuation_fn=gordon_growth_value,
+        )
+        assert table[0.02] > 0  # valid
+        import math
+        assert math.isnan(table[0.05])  # g == ke
+        assert math.isnan(table[0.06])  # g > ke

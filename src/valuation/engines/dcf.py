@@ -14,7 +14,7 @@ Methodology: Damodaran (Investment Valuation, 3rd ed.)
 from __future__ import annotations
 
 import math
-from typing import List
+from typing import Callable, List
 
 
 # ---------------------------------------------------------------------------
@@ -494,3 +494,47 @@ def ddm_valuation(
         "yearly_dps": yearly_dps,
         "yearly_pv": yearly_pv,
     }
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity Table Generators
+# ---------------------------------------------------------------------------
+
+def sensitivity_table(
+    base_params: dict,
+    vary_param: str,
+    vary_values: list[float],
+    valuation_fn: Callable,
+) -> dict[float, float]:
+    """One-way sensitivity: vary one parameter, compute value for each.
+    Returns {param_value: valuation_result}. Catches ValueError/ZeroDivisionError as NaN."""
+    results = {}
+    for v in vary_values:
+        params = {**base_params, vary_param: v}
+        try:
+            results[v] = valuation_fn(**params)
+        except (ValueError, ZeroDivisionError):
+            results[v] = float("nan")
+    return results
+
+
+def two_way_sensitivity_table(
+    base_params: dict,
+    row_param: str,
+    row_values: list[float],
+    col_param: str,
+    col_values: list[float],
+    valuation_fn: Callable,
+) -> dict[float, dict[float, float]]:
+    """Two-way sensitivity: vary two parameters.
+    Returns {row_value: {col_value: valuation_result}}."""
+    results = {}
+    for rv in row_values:
+        results[rv] = {}
+        for cv in col_values:
+            params = {**base_params, row_param: rv, col_param: cv}
+            try:
+                results[rv][cv] = valuation_fn(**params)
+            except (ValueError, ZeroDivisionError):
+                results[rv][cv] = float("nan")
+    return results
