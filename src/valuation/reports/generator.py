@@ -60,6 +60,7 @@ def generate_report(ctx: ValuationContext) -> str:
     sections: list[str] = [
         _section_executive_summary(ctx),
         _section_company_profile(ctx),
+        _section_company_context(ctx),
         _section_key_assumptions(ctx),
         _section_dcf_valuation(ctx),
         _section_relative_valuation(ctx),
@@ -258,6 +259,48 @@ def _section_company_profile(ctx: ValuationContext) -> str:
     ]
     table = _md_table(["Field", "Value"], rows)
     return "## Company Profile\n\n" + table
+
+
+def _section_company_context(ctx: ValuationContext) -> str:
+    """Company context: business description, recent news, key metrics."""
+    profile = ctx.financials.key_stats.get("company_profile") or {}
+    news = ctx.financials.key_stats.get("company_news") or []
+
+    if not profile and not news:
+        return ""
+
+    lines = ["## Company Context"]
+
+    desc = profile.get("description", "")
+    if desc:
+        lines += ["", desc[:800]]
+
+    # Key metrics
+    metrics = []
+    if profile.get("revenue_growth"):
+        metrics.append(("Revenue Growth (YoY)", _fmt_pct(profile["revenue_growth"])))
+    if profile.get("earnings_growth"):
+        metrics.append(("Earnings Growth (YoY)", _fmt_pct(profile["earnings_growth"])))
+    if profile.get("profit_margins"):
+        metrics.append(("Profit Margins", _fmt_pct(profile["profit_margins"])))
+    if profile.get("peg_ratio"):
+        metrics.append(("PEG Ratio", f"{profile['peg_ratio']:.2f}"))
+    if profile.get("recommendation_key"):
+        metrics.append(("Analyst Consensus", profile["recommendation_key"]))
+    if profile.get("employees"):
+        metrics.append(("Employees", f"{profile['employees']:,}"))
+    if metrics:
+        lines += ["", _md_table(["Metric", "Value"], metrics)]
+
+    # Recent news
+    if news:
+        lines += ["", "### Recent News", ""]
+        for n in news[:5]:
+            title = n.get("title", "")
+            publisher = n.get("publisher", "")
+            lines.append(f"- **{title}** ({publisher})")
+
+    return "\n".join(lines)
 
 
 def _section_key_assumptions(ctx: ValuationContext) -> str:

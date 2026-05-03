@@ -198,6 +198,32 @@ def run(ticker: str, growth_override: float | None = None,
     print(f"  Model: {cl.suggested_model}")
 
     # ================================================================
+    # STEP 4.5: Gather Context (news, profile) — for LLM narrative
+    # ================================================================
+    print(f"\n--- Step 4.5: Gather Context ---")
+    from valuation.data.news_fetcher import build_context_summary, fetch_company_news, fetch_company_profile
+
+    company_profile = fetch_company_profile(ticker)
+    company_news = fetch_company_news(ticker)
+    context_summary = build_context_summary(ticker, data.name or ticker)
+
+    # Store for report
+    ctx.financials.key_stats["company_profile"] = company_profile
+    ctx.financials.key_stats["company_news"] = company_news
+    ctx.financials.key_stats["context_summary"] = context_summary
+
+    if company_profile.get("description"):
+        print(f"  Profile: {company_profile['description'][:150]}...")
+    if company_profile.get("revenue_growth"):
+        print(f"  Revenue Growth (YoY): {company_profile['revenue_growth']:.1%}")
+    if company_profile.get("earnings_growth"):
+        print(f"  Earnings Growth (YoY): {company_profile['earnings_growth']:.1%}")
+    if company_news:
+        print(f"  Recent news: {len(company_news)} articles")
+        for n in company_news[:3]:
+            print(f"    - {n['title'][:80]}")
+
+    # ================================================================
     # STEP 5: Risk Assessment
     # ================================================================
     print(f"\n--- Step 5: Risk Assessment ---")

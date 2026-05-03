@@ -289,6 +289,23 @@ def _write_summary(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
         for flag in ctx.confidence.flags:
             rows.append([flag, ""])
 
+    # Company context
+    profile = ctx.financials.key_stats.get("company_profile") or {}
+    news = ctx.financials.key_stats.get("company_news") or []
+
+    if profile.get("description"):
+        rows.append(["", ""])
+        rows.append(["COMPANY DESCRIPTION", ""])
+        desc = profile["description"]
+        for i in range(0, len(desc), 100):
+            rows.append([desc[i:i + 100], ""])
+
+    if news:
+        rows.append(["", ""])
+        rows.append(["RECENT NEWS", ""])
+        for n in news[:5]:
+            rows.append([n.get("title", ""), n.get("publisher", "")])
+
     cols = ["Item", "Value", "vs Market"] if has_upside else ["Item", "Value"]
     # Pad rows to match column count
     ncols = len(cols)
