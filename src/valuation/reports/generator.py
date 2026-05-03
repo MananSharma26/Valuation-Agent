@@ -20,6 +20,20 @@ from valuation.context import ValuationContext
 # Default reports directory (project root / reports)
 _REPORTS_DIR = pathlib.Path(__file__).parent.parent.parent.parent / "reports"
 
+# Module-level currency symbol; overridden per-report inside generate_report()
+_CURRENCY = "$"
+
+
+def _currency_symbol(region: str | None) -> str:
+    """Return the currency symbol for a given region string."""
+    return {
+        "India": "\u20b9",   # ₹
+        "Japan": "\u00a5",   # ¥
+        "China": "\u00a5",   # ¥
+        "Europe": "\u20ac",  # €
+        "UK": "\u00a3",      # £
+    }.get(region or "", "$")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -40,6 +54,9 @@ def generate_report(ctx: ValuationContext) -> str:
     str
         A non-empty markdown string suitable for display or saving.
     """
+    global _CURRENCY
+    _CURRENCY = _currency_symbol(ctx.company.region)
+
     sections: list[str] = [
         _section_executive_summary(ctx),
         _section_company_profile(ctx),
@@ -126,10 +143,15 @@ def save_report(ctx: ValuationContext, reports_dir: str | pathlib.Path | None = 
 
 
 def _fmt(value: float | None, decimals: int = 2, prefix: str = "") -> str:
-    """Format a float with a prefix (e.g. '$') or return 'N/A'."""
+    """Format a float with a prefix (e.g. '$') or return 'N/A'.
+
+    When prefix is the literal "$", the module-level _CURRENCY symbol is used
+    instead so that reports for non-USD companies show the correct symbol.
+    """
     if value is None:
         return "N/A"
-    return f"{prefix}{value:,.{decimals}f}"
+    resolved_prefix = _CURRENCY if prefix == "$" else prefix
+    return f"{resolved_prefix}{value:,.{decimals}f}"
 
 
 def _fmt_pct(value: float | None, decimals: int = 1) -> str:

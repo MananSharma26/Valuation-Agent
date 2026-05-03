@@ -220,13 +220,19 @@ def _extract_model_values(ctx: "ValuationContext") -> dict[str, float]:
         values["dcf_fcfe"] = ctx.outputs.dcf_fcfe["value_per_share"]
 
     if ctx.outputs.relative:
-        # Take the average of available relative valuations
-        rel_vals = [
-            v for k, v in ctx.outputs.relative.items()
-            if k.startswith("implied_value_") and isinstance(v, (int, float)) and v > 0
-        ]
-        if rel_vals:
-            values["relative"] = sum(rel_vals) / len(rel_vals)
+        # Use composite_value (median of multiples) if available, otherwise
+        # fall back to the average of individual implied values.
+        composite = ctx.outputs.relative.get("composite_value")
+        if composite is not None and composite > 0:
+            values["relative"] = float(composite)
+        else:
+            rel_vals = [
+                v for k, v in ctx.outputs.relative.items()
+                if k in ("pe_value", "ev_ebitda_value", "pbv_value", "ps_value")
+                and isinstance(v, (int, float)) and v > 0
+            ]
+            if rel_vals:
+                values["relative"] = sum(rel_vals) / len(rel_vals)
 
     if ctx.outputs.excess_returns and "value_per_share" in ctx.outputs.excess_returns:
         values["excess_returns"] = ctx.outputs.excess_returns["value_per_share"]
