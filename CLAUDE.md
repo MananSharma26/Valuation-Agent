@@ -19,6 +19,15 @@ This runs ALL 13 steps, fetches analyst consensus from I/B/E/S, runs sensitivity
 
 For interactive overrides, present assumptions first (see Step 7 below), then rerun with `--growth`, `--terminal`, or `--classification` flags.
 
+### System Prompts
+
+When running interactively (not via `run_valuation.py`), read the relevant prompt before each judgment call:
+
+- **Before classifying:** Read `config/prompts/classifier.md` for ambiguous cases
+- **Before proposing growth:** Read `config/prompts/growth_narrative.md` for reasoning framework
+- **Before explaining divergence:** Read `config/prompts/cross_validation.md` for interpretation
+- **For report narrative:** Read `config/prompts/report.md` for Damodaran's story+numbers style
+
 ## Project Overview
 
 This is a **multi-agent valuation system** that values public companies using Damodaran methodology. Claude Code is the orchestrator: it calls deterministic Python modules for all financial math, interprets results, proposes assumptions to the user, handles overrides, and assembles a final report.

@@ -42,6 +42,7 @@ from valuation.scoring.confidence import score_all
 from valuation.reports.generator import generate_report, save_report
 from valuation.reports.excel_writer import generate_excel
 from valuation.validation.pre_engine import validate_for_dcf
+from valuation.validation.sourced import from_yahoo, from_damodaran, from_user, computed, missing
 
 
 def find_damodaran_dir() -> pathlib.Path:
@@ -111,6 +112,9 @@ def run(ticker: str, growth_override: float | None = None,
     print(f"  Date: {date.today().isoformat()}")
     print(f"{'='*70}")
 
+    # Source tracking dict — populated throughout the pipeline
+    sourced_inputs: dict = {}
+
     # ================================================================
     # STEP 1: Fetch Company Data
     # ================================================================
@@ -125,6 +129,12 @@ def run(ticker: str, growth_override: float | None = None,
     print(f"  Country: {data.country}")
     print(f"  Price: {data.price:,.2f} | Market Cap: {data.market_cap:,.0f}")
     print(f"  Shares: {data.shares_outstanding:,.0f}")
+
+    # Tag Yahoo Finance inputs
+    sourced_inputs["price"] = from_yahoo(data.price)
+    sourced_inputs["market_cap"] = from_yahoo(data.market_cap)
+    sourced_inputs["shares"] = from_yahoo(data.shares_outstanding)
+    sourced_inputs["beta_yfinance"] = from_yahoo(data.beta)
 
     # ================================================================
     # STEP 2: Normalize
@@ -162,6 +172,8 @@ def run(ticker: str, growth_override: float | None = None,
             ctx.benchmarks.industry_growth = bm["growth"]
         print(f"  Matched: {match.matched_name} (score {match.score})")
         print(f"  Industry Beta: {bm['beta']:.2f} | WACC: {bm['wacc']:.2%}")
+        sourced_inputs["industry_beta"] = from_damodaran(bm["beta"], "betas.xls")
+        sourced_inputs["industry_wacc"] = from_damodaran(bm["wacc"], "wacc.xls")
     else:
         print(f"  WARNING: No strong industry match (best: {match.matched_name if match else 'none'}, score {match.score if match else 0})")
         print(f"  Candidates: {match.candidates[:3] if match else []}")
@@ -239,6 +251,14 @@ def run(ticker: str, growth_override: float | None = None,
     print(f"  Beta: {beta:.3f} (industry bottom-up, re-levered)")
     print(f"  Ke: {ke:.2%} | Kd: {cod:.2%} ({rating})")
     print(f"  WACC: {wacc:.2%} | D/E: {company_de:.4f} | Tax: {tax_rate:.1%}")
+
+    sourced_inputs["risk_free_rate"] = from_damodaran(rf, "histretSP.xls / local Rf")
+    sourced_inputs["erp"] = from_damodaran(erp, "histimpl.xls")
+    sourced_inputs["beta"] = computed(beta, "Industry unlevered beta re-levered")
+    sourced_inputs["cost_of_equity"] = computed(ke, "CAPM: Rf + beta*(ERP+CRP)")
+    sourced_inputs["cost_of_debt"] = computed(cod, "Rf + synthetic spread from ICR")
+    sourced_inputs["wacc"] = computed(wacc, "Ke*E/(D+E) + Kd*(1-t)*D/(D+E)")
+    sourced_inputs["tax_rate"] = computed(tax_rate, "Tax Provision / Pretax Income")
 
     # ================================================================
     # STEP 6: Growth Estimation
@@ -344,6 +364,15 @@ def run(ticker: str, growth_override: float | None = None,
 
     print(f"\n  → Using: {high_growth:.2%} high-growth → {terminal_growth:.2%} terminal over {n_years} years")
 
+    if growth_override is not None:
+        sourced_inputs["high_growth"] = from_user(high_growth, f"CLI override: {growth_override:.2%}")
+    else:
+        sourced_inputs["high_growth"] = computed(high_growth, "Damodaran hierarchy (ROE*retention / revenue CAGR)")
+    if terminal_override is not None:
+        sourced_inputs["terminal_growth"] = from_user(terminal_growth, f"CLI override: {terminal_override:.2%}")
+    else:
+        sourced_inputs["terminal_growth"] = computed(terminal_growth, "Nominal GDP proxy")
+
     # ================================================================
     # STEP 7: Validate Before Engines
     # ================================================================
@@ -371,6 +400,7 @@ def run(ticker: str, growth_override: float | None = None,
     depr = float(cf.iloc[0].get('Depreciation And Amortization', 0) or 0) if cf is not None and len(cf) > 0 else 0
 
     if ctx.company.classification == "financial":
+        print(f"  [Financial routing] Using DDM + Excess Returns (not FCFF)")
         # DDM for financial firms
         eps = net_income / data.shares_outstanding if data.shares_outstanding > 0 else 0
         payout_rates = interpolate_params(
@@ -448,6 +478,7 @@ def run(ticker: str, growth_override: float | None = None,
         s2c = revenue / invested_capital if invested_capital > 0 else 2.5
         s2c = max(min(s2c, 10.0), 0.5)  # bound
 
+        sourced_inputs["sales_to_capital"] = computed(s2c, "Revenue / Invested Capital (from balance sheet)")
         print(f"  [Schedules] WACC: {wacc:.2%} → {t_wacc:.2%} | Tax: {tax_rate:.1%} → 25%")
         print(f"  [Schedules] Margin: {current_margin:.1%} → {target_margin:.1%} | S2C: {s2c:.2f}")
 
@@ -493,6 +524,9 @@ def run(ticker: str, growth_override: float | None = None,
             except (ValueError, ZeroDivisionError):
                 pass
 
+    # Store sourced inputs in context for report transparency
+    ctx.financials.key_stats["sourced_inputs"] = sourced_inputs
+
     # Relative valuation (always run)
     eps = net_income / data.shares_outstanding if data.shares_outstanding > 0 else 0
     rev_ps = revenue / data.shares_outstanding if data.shares_outstanding > 0 else 0
@@ -512,6 +546,30 @@ def run(ticker: str, growth_override: float | None = None,
     if rel.composite_value: print(f"    Composite (median): {rel.composite_value:,.2f}")
     if rel.discount_to_composite is not None:
         print(f"    vs Market: {rel.discount_to_composite:+.1%}")
+
+    # Validate outputs against sanity bounds
+    from valuation.validation.bounds import check_all_inputs
+    output_checks: dict[str, float | None] = {}
+    if ctx.outputs.dcf_fcff:
+        per_share = ctx.outputs.dcf_fcff.get("equity_value_per_share", 0)
+        output_checks["equity_value_per_share"] = per_share
+        if data.price > 0 and per_share and per_share > 0:
+            ratio = per_share / data.price
+            if ratio > 5:
+                print(f"  DCF value ({per_share:,.0f}) is {ratio:.1f}x market price — check assumptions")
+            elif ratio < 0.1:
+                print(f"  DCF value ({per_share:,.0f}) is only {ratio:.0%} of market price — check assumptions")
+    # Add key assumption bounds checks
+    output_checks["wacc"] = ctx.assumptions.wacc
+    output_checks["terminal_growth"] = ctx.assumptions.terminal_growth
+    output_checks["beta"] = ctx.assumptions.beta
+    output_checks["cost_of_equity"] = ctx.assumptions.cost_of_equity
+    output_checks["cost_of_debt"] = ctx.assumptions.cost_of_debt
+    bounds_report = check_all_inputs(output_checks)
+    for bc in bounds_report.warnings:
+        print(f"  Bounds WARN: {bc.message}")
+    for bc in bounds_report.halts:
+        print(f"  Bounds HALT: {bc.message}")
 
     # ================================================================
     # STEP 9: Sensitivity Analysis

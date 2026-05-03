@@ -67,6 +67,7 @@ def generate_report(ctx: ValuationContext) -> str:
         _section_analyst_consensus(ctx),
         _section_sensitivity_analysis(ctx),
         _section_confidence_assessment(ctx),
+        _section_data_sources(ctx),
     ]
     # Filter out empty sections (returns empty string when data is absent)
     body = "\n\n---\n\n".join(s for s in sections if s.strip())
@@ -753,6 +754,15 @@ def _section_confidence_assessment(ctx: ValuationContext) -> str:
             lines.append(f"- {flag}")
 
     return "\n".join(lines)
+
+
+def _section_data_sources(ctx: ValuationContext) -> str:
+    """Render a data sources transparency table."""
+    sourced = ctx.financials.key_stats.get("sourced_inputs") if ctx.financials.key_stats else None
+    if not sourced:
+        return ""
+    from valuation.validation.data_sources import format_sources_markdown
+    return "## Data Sources\n\n" + format_sources_markdown(sourced)
 
 
 # ---------------------------------------------------------------------------
