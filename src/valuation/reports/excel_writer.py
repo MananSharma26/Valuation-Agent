@@ -765,19 +765,80 @@ def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 def _write_analyst_consensus(
     writer: pd.ExcelWriter, ctx: ValuationContext, ibes_data: dict | None
 ) -> None:
-    """Sheet 6: Analyst consensus comparison (I/B/E/S data shown alongside our estimates)."""
+    """Sheet 6: Analyst consensus comparison — Yahoo Finance + I/B/E/S."""
+    analyst_data = ctx.financials.key_stats.get("analyst_data") or {}
+    price = ctx.financials.key_stats.get("price")
+    pt = analyst_data.get("price_targets") or {}
+    recs = analyst_data.get("recommendations") or []
+    ee = analyst_data.get("earnings_estimate") or {}
+
     rows = [
         ["ANALYST CONSENSUS vs OUR ESTIMATE", "", "", ""],
         ["(Consensus is for COMPARISON ONLY — not used as DCF input)", "", "", ""],
         ["", "", "", ""],
     ]
 
+    # --- Price Targets ---
+    if pt:
+        rows.append(["PRICE TARGETS (Yahoo Finance)", "", "", ""])
+        rows.append(["Mean Target", _safe(pt.get("targetMean")), "", ""])
+        rows.append(["Median Target", _safe(pt.get("targetMedian")), "", ""])
+        rows.append(["High Target", _safe(pt.get("targetHigh")), "", ""])
+        rows.append(["Low Target", _safe(pt.get("targetLow")), "", ""])
+        if pt.get("numberOfAnalysts"):
+            rows.append(["# Analysts", pt["numberOfAnalysts"], "", ""])
+        rows.append(["", "", "", ""])
+
+    # --- Analyst Recommendations ---
+    if recs:
+        rows.append(["ANALYST RECOMMENDATIONS", "", "", ""])
+        rows.append(["Period", "Strong Buy", "Buy", "Hold / Sell"])
+        for rec in recs[:4]:
+            period = rec.get("period", "")
+            sb = rec.get("strongBuy", 0)
+            b = rec.get("buy", 0)
+            h = rec.get("hold", 0)
+            s = rec.get("sell", 0) + rec.get("strongSell", 0)
+            rows.append([period, sb, b, f"{h} / {s}"])
+        total_latest = recs[0] if recs else {}
+        total = sum(total_latest.get(k, 0) for k in ("strongBuy", "buy", "hold", "sell", "strongSell"))
+        if total > 0:
+            buy_pct = (total_latest.get("strongBuy", 0) + total_latest.get("buy", 0)) / total
+            rows.append(["% Buy/Strong Buy", buy_pct, "", f"of {total} analysts"])
+        rows.append(["", "", "", ""])
+
+    # --- Earnings Estimates ---
+    if ee and "avg" in ee:
+        rows.append(["CONSENSUS EPS ESTIMATES", "Average", "Low", "High"])
+        avg = ee.get("avg", {})
+        low = ee.get("low", {})
+        high = ee.get("high", {})
+        growth = ee.get("growth", {})
+        num = ee.get("numberOfAnalysts", {})
+        for period, label in [("0q", "Current Quarter"), ("+1q", "Next Quarter"),
+                               ("0y", "Current Year"), ("+1y", "Next Year")]:
+            if period in avg:
+                rows.append([
+                    f"{label} ({period})",
+                    _safe(avg.get(period)),
+                    _safe(low.get(period)),
+                    _safe(high.get(period)),
+                ])
+        rows.append(["", "", "", ""])
+        rows.append(["CONSENSUS GROWTH ESTIMATES", "Growth Rate", "# Analysts", ""])
+        for period, label in [("0q", "Current Qtr"), ("+1q", "Next Qtr"),
+                               ("0y", "Current Year"), ("+1y", "Next Year")]:
+            if period in growth:
+                rows.append([label, _safe(growth.get(period)), _safe(num.get(period)), ""])
+        rows.append(["", "", "", ""])
+
+    # --- I/B/E/S (if available) ---
     if ibes_data and "estimates" in ibes_data:
         est = ibes_data["estimates"]
         if est is not None and not est.empty:
-            rows.append(["I/B/E/S Consensus Estimates", "", "", ""])
+            rows.append(["I/B/E/S CONSENSUS (WRDS)", "", "", ""])
             rows.append(["Period", "Mean EPS", "Median EPS", "# Analysts"])
-            for _, row in est.iterrows():
+            for _, row in est.head(6).iterrows():
                 rows.append([
                     str(row.get("statpers", "")),
                     _safe(row.get("meanest")),
@@ -786,28 +847,56 @@ def _write_analyst_consensus(
                 ])
             rows.append(["", "", "", ""])
 
-        if "ticker" in ibes_data:
-            rows.append(["I/B/E/S Ticker", ibes_data["ticker"], "", ""])
-
-    rows.append(["", "", "", ""])
-    rows.append(["OUR FUNDAMENTAL ESTIMATES", "", "", ""])
-
+    # --- Our Estimate vs Consensus ---
+    rows.append(["OUR ESTIMATE vs CONSENSUS", "Value", "vs Market", ""])
+    our_dcf = None
     if ctx.outputs.dcf_fcff:
-        rows.append(["DCF (FCFF) Value/Share", ctx.outputs.dcf_fcff.get("equity_value_per_share"), "", ""])
+        our_dcf = ctx.outputs.dcf_fcff.get("equity_value_per_share")
+        vs = (our_dcf - price) / price if price and price > 0 and our_dcf else None
+        rows.append(["Our DCF (FCFF)", _safe(our_dcf), _safe(vs), "Independent fundamental"])
     if ctx.outputs.dcf_fcfe:
-        rows.append(["DDM Value/Share", ctx.outputs.dcf_fcfe.get("value_per_share"), "", ""])
-
+        our_ddm = ctx.outputs.dcf_fcfe.get("value_per_share")
+        vs = (our_ddm - price) / price if price and price > 0 and our_ddm else None
+        rows.append(["Our DDM", _safe(our_ddm), _safe(vs), "Independent fundamental"])
+    if ctx.outputs.relative and ctx.outputs.relative.get("composite_value"):
+        comp = ctx.outputs.relative["composite_value"]
+        vs = (comp - price) / price if price and price > 0 else None
+        rows.append(["Our Relative (composite)", _safe(comp), _safe(vs), "Industry multiples"])
+    if pt.get("targetMean"):
+        vs = (pt["targetMean"] - price) / price if price and price > 0 else None
+        rows.append(["Analyst Mean Target", _safe(pt["targetMean"]), _safe(vs), "Yahoo Finance consensus"])
+    rows.append(["Market Price", _safe(price), "", "Current"])
     rows.append(["", "", "", ""])
-    rows.append(["GROWTH COMPARISON", "Our Estimate", "Consensus", "Source"])
-    if ctx.assumptions.growth_rates:
-        rows.append(["Year 1 Growth", ctx.assumptions.growth_rates[0], "", "Fundamental"])
-    if ctx.assumptions.terminal_growth:
-        rows.append(["Terminal Growth", ctx.assumptions.terminal_growth, "", "Nominal GDP"])
 
-    price = ctx.financials.key_stats.get("price")
-    if price:
-        rows.append(["", "", "", ""])
-        rows.append(["Market Price", price, "", "Yahoo Finance"])
+    # --- Why Our Valuation Differs ---
+    rows.append(["WHY OUR VALUATION MAY DIFFER FROM CONSENSUS", "", "", ""])
+    if our_dcf and pt.get("targetMean") and price:
+        diff = our_dcf - pt["targetMean"]
+        if abs(diff) > price * 0.05:
+            if our_dcf < pt["targetMean"]:
+                rows.append(["Our DCF is BELOW analyst targets", "", "", ""])
+                rows.append(["Possible reasons:", "", "", ""])
+                rows.append(["  1. We use fundamental growth (ROE×retention)", "", "", "not analyst forecasts"])
+                rows.append(["  2. Our WACC may be higher (more conservative)", "", "", ""])
+                rows.append(["  3. Analysts may factor in optionality/catalysts", "", "", "we don't"])
+                rows.append(["  4. Our terminal growth may be lower", "", "", ""])
+            else:
+                rows.append(["Our DCF is ABOVE analyst targets", "", "", ""])
+                rows.append(["Possible reasons:", "", "", ""])
+                rows.append(["  1. Our fundamental growth may be more optimistic", "", "", ""])
+                rows.append(["  2. Our WACC may be lower", "", "", ""])
+                rows.append(["  3. Analysts may see risks we haven't captured", "", "", ""])
+        else:
+            rows.append(["Our DCF is roughly aligned with analyst targets", "", "", ""])
+
+    # --- Growth comparison ---
+    rows.append(["", "", "", ""])
+    rows.append(["GROWTH: OUR ESTIMATE vs CONSENSUS", "Our", "Consensus", ""])
+    if ctx.assumptions.growth_rates:
+        our_g = ctx.assumptions.growth_rates[0]
+        cons_g = ee.get("growth", {}).get("+1y")
+        rows.append(["Year 1 Growth", _safe(our_g), _safe(cons_g), ""])
+    rows.append(["Terminal Growth", _safe(ctx.assumptions.terminal_growth), "N/A", "Nominal GDP"])
 
     df = pd.DataFrame(rows, columns=["Item", "Value 1", "Value 2", "Notes"])
     df.to_excel(writer, sheet_name="Analyst Consensus", index=False)
