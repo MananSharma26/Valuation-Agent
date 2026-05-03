@@ -86,8 +86,14 @@ def fetch_ibes_consensus(company_name: str, ticker: str = "", currency: str = "I
             if results is not None and len(results) > 0:
                 ibes_ticker = results.iloc[0]["ticker"]
                 estimates = w.fetch_ibes_estimates(ibes_ticker, region=region)
+                top_analysts = w.fetch_top_analysts(ibes_ticker, region=region, top_n=10)
                 w.close()
-                return {"ticker": ibes_ticker, "estimates": estimates, "search_results": results}
+                return {
+                    "ticker": ibes_ticker,
+                    "estimates": estimates,
+                    "top_analysts": top_analysts,
+                    "search_results": results,
+                }
 
         w.close()
     except Exception as e:

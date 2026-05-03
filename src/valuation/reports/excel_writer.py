@@ -1046,6 +1046,29 @@ def _write_analyst_consensus(
                 ])
             rows.append(["", "", "", ""])
 
+    # --- Top Analysts (accuracy-ranked) ---
+    top_analysts = ibes_data.get("top_analysts") if ibes_data else None
+    if top_analysts is not None and not top_analysts.empty:
+        rows.append(["TOP ANALYSTS (Ranked by EPS Forecast Accuracy)", "", "", ""])
+        rows.append(["Analyst", "Firm", "Accuracy", "Target", "Recommendation", "# Estimates"])
+        # Extend to 6 columns — pad existing rows below
+        for _, row in top_analysts.iterrows():
+            analyst_name = str(row.get("analyst_name") or "N/A")
+            firm = str(row.get("firm") or "N/A")
+            acc = row.get("accuracy_pct")
+            target = row.get("target")
+            rec = str(row.get("recommendation") or "N/A")
+            num_est = row.get("num_estimates")
+            rows.append([
+                analyst_name,
+                firm,
+                _safe(acc / 100.0) if acc is not None else "",
+                _safe(target) if target is not None else "",
+                rec,
+                _safe(num_est) if num_est is not None else "",
+            ])
+        rows.append(["", "", "", "", "", ""])
+
     # --- Our Estimate vs Consensus ---
     rows.append(["OUR ESTIMATE vs CONSENSUS", "Value", "vs Market", ""])
     our_dcf = None
@@ -1097,23 +1120,51 @@ def _write_analyst_consensus(
         rows.append(["Year 1 Growth", _safe(our_g), _safe(cons_g), ""])
     rows.append(["Terminal Growth", _safe(ctx.assumptions.terminal_growth), "N/A", "Nominal GDP"])
 
-    df = pd.DataFrame(rows, columns=["Item", "Value 1", "Value 2", "Notes"])
+    # Pad all rows to 6 columns
+    n_cols = 6
+    for r in rows:
+        while len(r) < n_cols:
+            r.append("")
+
+    df = pd.DataFrame(rows, columns=["Item", "Value 1", "Value 2", "Notes", "Col5", "Col6"])
     df.to_excel(writer, sheet_name="Analyst Consensus", index=False)
 
     ws = _ws(writer, "Analyst Consensus")
-    _style_header_row(ws, 1, 4)
+    _style_header_row(ws, 1, n_cols)
 
-    pct_rows = {"year 1 growth", "terminal growth"}
+    pct_rows = {"year 1 growth", "terminal growth", "accuracy"}
+    in_top_analysts = False
     for row_idx in range(2, ws.max_row + 1):
         label = ws.cell(row=row_idx, column=1).value or ""
+        label_lower = str(label).strip().lower()
 
         if _is_section_title(label):
-            _style_section_title(ws, row_idx, 4)
+            _style_section_title(ws, row_idx, n_cols)
+            if "top analysts" in label_lower:
+                in_top_analysts = True
+            elif label_lower != "":
+                in_top_analysts = False
             continue
+
+        # Style top analysts sub-header row (Analyst | Firm | Accuracy | ...)
+        if label_lower == "analyst":
+            _style_header_row(ws, row_idx, n_cols)
+            in_top_analysts = True
+            continue
+
+        # Format accuracy column (col 3) as percentage in top analysts block
+        if in_top_analysts:
+            acc_cell = ws.cell(row=row_idx, column=3)
+            if isinstance(acc_cell.value, (int, float)) and abs(acc_cell.value) <= 1:
+                acc_cell.number_format = _FMT_PCT
+                acc_cell.alignment = _RIGHT
+            tgt_cell = ws.cell(row=row_idx, column=4)
+            if isinstance(tgt_cell.value, (int, float)):
+                tgt_cell.number_format = _FMT_PRICE
+                tgt_cell.alignment = _RIGHT
 
         val_cell = ws.cell(row=row_idx, column=2)
         if isinstance(val_cell.value, (int, float)):
-            label_lower = str(label).lower()
             if label_lower in pct_rows and abs(val_cell.value) <= 3:
                 val_cell.number_format = _FMT_PCT
             else:

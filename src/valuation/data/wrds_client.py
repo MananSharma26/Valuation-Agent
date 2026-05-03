@@ -165,6 +165,159 @@ class WRDSClient:
             return None
         return result
 
+    def fetch_top_analysts(self, ticker: str, region: str = "us", top_n: int = 10) -> pd.DataFrame | None:
+        """Fetch accuracy-ranked analysts with their latest targets and recommendations.
+
+        Accuracy = 1 - avg(|estimate - actual| / |actual|) over recent fiscal periods.
+        Only includes analysts with 2+ estimates that have actuals.
+
+        Args:
+            ticker: I/B/E/S ticker (e.g., 'NVDA' for US, '@V9T' for TCS)
+            region: 'us' for US stocks, 'int' for international
+            top_n: Number of top analysts to return
+
+        Returns:
+            DataFrame with columns: analyst_name, firm, accuracy_pct, target,
+            recommendation, num_estimates, latest_date
+            Returns None if no data found or query fails.
+        """
+        db = self._connect()
+        det_table = "tr_ibes.det_epsus" if region == "us" else "tr_ibes.det_epsint"
+
+        # Step 1: Compute per-analyst average absolute percentage error
+        # Only use estimates that have an actual value and are from 2022 onward
+        try:
+            accuracy_df = db.raw_sql(f"""
+                SELECT
+                    analys,
+                    COUNT(*) AS num_estimates,
+                    AVG(ABS(value - actual) / NULLIF(ABS(actual), 0)) AS avg_error,
+                    MAX(anndats) AS latest_date
+                FROM {det_table}
+                WHERE ticker = %(ticker)s
+                  AND actual IS NOT NULL
+                  AND value IS NOT NULL
+                  AND ABS(actual) > 0
+                  AND anndats >= '2022-01-01'
+                GROUP BY analys
+                HAVING COUNT(*) >= 2
+                ORDER BY avg_error ASC
+                LIMIT %(limit)s
+            """, params={"ticker": ticker, "limit": top_n * 3})
+        except Exception:
+            return None
+
+        if accuracy_df is None or accuracy_df.empty:
+            return None
+
+        analyst_ids = accuracy_df["analys"].tolist()
+
+        # Step 2: Get analyst names and firm codes from ptgdet (most recent per analyst)
+        # amaskcd in ptgdet matches analys in det_epsus
+        try:
+            names_df = db.raw_sql("""
+                SELECT DISTINCT ON (amaskcd)
+                    amaskcd,
+                    alysnam,
+                    estimid
+                FROM tr_ibes.ptgdet
+                WHERE ticker = %(ticker)s
+                  AND amaskcd = ANY(%(ids)s)
+                ORDER BY amaskcd, revdats DESC, revtims DESC
+            """, params={"ticker": ticker, "ids": analyst_ids})
+        except Exception:
+            names_df = pd.DataFrame(columns=["amaskcd", "alysnam", "estimid"])
+
+        # Step 3: Get latest price target per analyst from ptgdet
+        try:
+            targets_df = db.raw_sql("""
+                SELECT DISTINCT ON (amaskcd)
+                    amaskcd,
+                    horizon,
+                    value AS target
+                FROM tr_ibes.ptgdet
+                WHERE ticker = %(ticker)s
+                  AND amaskcd = ANY(%(ids)s)
+                  AND value IS NOT NULL
+                ORDER BY amaskcd, revdats DESC, revtims DESC
+            """, params={"ticker": ticker, "ids": analyst_ids})
+        except Exception:
+            targets_df = pd.DataFrame(columns=["amaskcd", "target"])
+
+        # Step 4: Get latest recommendation per analyst from recddet
+        try:
+            recs_df = db.raw_sql("""
+                SELECT DISTINCT ON (amaskcd)
+                    amaskcd,
+                    irec
+                FROM tr_ibes.recddet
+                WHERE ticker = %(ticker)s
+                  AND amaskcd = ANY(%(ids)s)
+                ORDER BY amaskcd, revdats DESC, revtims DESC
+            """, params={"ticker": ticker, "ids": analyst_ids})
+        except Exception:
+            recs_df = pd.DataFrame(columns=["amaskcd", "irec"])
+
+        # Recommendation code mapping (I/B/E/S IREC coding)
+        irec_map = {1: "STRONG BUY", 2: "BUY", 3: "HOLD", 4: "SELL", 5: "STRONG SELL"}
+
+        # Step 5: Assemble final DataFrame
+        results = []
+        for _, acc_row in accuracy_df.iterrows():
+            analyst_id = acc_row["analys"]
+            avg_err = acc_row["avg_error"]
+            num_est = int(acc_row["num_estimates"])
+            latest = acc_row["latest_date"]
+
+            # Accuracy as percentage (100% = perfect)
+            accuracy_pct = max(0.0, (1.0 - float(avg_err)) * 100) if avg_err is not None else None
+
+            # Name and firm
+            analyst_name = None
+            firm = None
+            if names_df is not None and not names_df.empty:
+                nm = names_df[names_df["amaskcd"] == analyst_id]
+                if not nm.empty:
+                    analyst_name = nm.iloc[0].get("alysnam")
+                    firm = nm.iloc[0].get("estimid")
+
+            # Target price
+            target = None
+            if targets_df is not None and not targets_df.empty:
+                tgt = targets_df[targets_df["amaskcd"] == analyst_id]
+                if not tgt.empty:
+                    target = tgt.iloc[0].get("target")
+
+            # Recommendation
+            recommendation = None
+            if recs_df is not None and not recs_df.empty:
+                rec = recs_df[recs_df["amaskcd"] == analyst_id]
+                if not rec.empty:
+                    irec_val = rec.iloc[0].get("irec")
+                    if irec_val is not None:
+                        try:
+                            recommendation = irec_map.get(int(irec_val), str(irec_val))
+                        except (ValueError, TypeError):
+                            recommendation = str(irec_val)
+
+            results.append({
+                "analyst_name": analyst_name if analyst_name else f"Analyst {analyst_id}",
+                "firm": firm if firm else "N/A",
+                "accuracy_pct": round(accuracy_pct, 1) if accuracy_pct is not None else None,
+                "target": float(target) if target is not None else None,
+                "recommendation": recommendation if recommendation else "N/A",
+                "num_estimates": num_est,
+                "latest_date": str(latest) if latest is not None else None,
+            })
+
+            if len(results) >= top_n:
+                break
+
+        if not results:
+            return None
+
+        return pd.DataFrame(results)
+
     def search_ibes_ticker(self, company_name: str, country_code: str = 'INR') -> pd.DataFrame:
         """Search for I/B/E/S ticker by company name.
 

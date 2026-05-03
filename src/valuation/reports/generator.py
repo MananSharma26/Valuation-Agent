@@ -621,6 +621,42 @@ def _section_analyst_consensus(ctx: ValuationContext) -> str:
         except Exception:
             lines.append("_I/B/E/S data could not be rendered._")
 
+    # ----------------------------------------------------------------
+    # Top Analysts block (accuracy-ranked)
+    # ----------------------------------------------------------------
+    top_analysts = ibes_data.get("top_analysts") if ibes_data else None
+    if top_analysts is not None:
+        try:
+            import pandas as pd  # noqa: PLC0415
+
+            if isinstance(top_analysts, pd.DataFrame) and not top_analysts.empty:
+                lines += [
+                    "",
+                    "### Top Analysts (Ranked by Forecast Accuracy)",
+                    "",
+                    "> Accuracy = 1 - avg(|estimate - actual| / |actual|) over recent fiscal periods.",
+                    "",
+                ]
+                analyst_rows: list[tuple] = []
+                for _, row in top_analysts.iterrows():
+                    name = str(row.get("analyst_name") or "N/A")
+                    firm = str(row.get("firm") or "N/A")
+                    acc = row.get("accuracy_pct")
+                    acc_str = f"{acc:.0f}%" if acc is not None else "N/A"
+                    target = row.get("target")
+                    target_str = _fmt(float(target), prefix="$") if target is not None else "N/A"
+                    rec = str(row.get("recommendation") or "N/A")
+                    num_est = row.get("num_estimates")
+                    num_str = str(int(num_est)) if num_est is not None else "N/A"
+                    analyst_rows.append((name, firm, acc_str, target_str, rec, num_str))
+                if analyst_rows:
+                    lines.append(_md_table(
+                        ["Analyst", "Firm", "Accuracy", "Target", "Recommendation", "# Estimates"],
+                        analyst_rows,
+                    ))
+        except Exception:
+            pass  # Silently skip if top_analysts data cannot be rendered
+
     return "\n".join(lines)
 
 
