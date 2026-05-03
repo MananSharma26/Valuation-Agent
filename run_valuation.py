@@ -80,11 +80,12 @@ def fetch_ibes_consensus(company_name: str, ticker: str = "", currency: str = "I
         # Full name as fallback
         queries.append(company_name)
 
+        region = "us" if currency == "USD" else "int"
         for q in queries:
             results = w.search_ibes_ticker(q, country_code=currency)
             if results is not None and len(results) > 0:
                 ibes_ticker = results.iloc[0]["ticker"]
-                estimates = w.fetch_ibes_estimates(ibes_ticker)
+                estimates = w.fetch_ibes_estimates(ibes_ticker, region=region)
                 w.close()
                 return {"ticker": ibes_ticker, "estimates": estimates, "search_results": results}
 

@@ -136,14 +136,24 @@ class WRDSClient:
             book_value_per_share=float(latest.get('ceq', 0) or 0) / shares if shares > 0 else 0,
         )
 
-    def fetch_ibes_estimates(self, ticker: str) -> pd.DataFrame | None:
-        """Fetch analyst consensus estimates from I/B/E/S."""
+    def _ibes_table(self, region: str = "int") -> str:
+        """Return correct I/B/E/S table name: _epsus for US, _epsint for international."""
+        return f"tr_ibes.statsum_eps{'us' if region == 'us' else 'int'}"
+
+    def fetch_ibes_estimates(self, ticker: str, region: str = "int") -> pd.DataFrame | None:
+        """Fetch analyst consensus estimates from I/B/E/S.
+
+        Args:
+            ticker: I/B/E/S ticker (e.g., 'NVDA' for US, '@V9T' for TCS India)
+            region: 'us' for US stocks, 'int' for international
+        """
         db = self._connect()
-        result = db.raw_sql('''
+        table = self._ibes_table(region)
+        result = db.raw_sql(f'''
             SELECT ticker, statpers, measure, fiscalp, fpi,
                    meanest, medest, highest, lowest, numest,
                    actual, stdev
-            FROM tr_ibes.statsum_epsint
+            FROM {table}
             WHERE ticker = %(ticker)s
             AND measure = %(measure)s
             AND fpi IN (%(fpi1)s, %(fpi2)s)
@@ -156,12 +166,38 @@ class WRDSClient:
         return result
 
     def search_ibes_ticker(self, company_name: str, country_code: str = 'INR') -> pd.DataFrame:
-        """Search for I/B/E/S ticker by company name."""
+        """Search for I/B/E/S ticker by company name.
+
+        Searches both US and international tables.
+        For US (country_code='USD'), searches statsum_epsus.
+        For others, searches statsum_epsint.
+        """
         db = self._connect()
-        return db.raw_sql('''
-            SELECT DISTINCT ticker, cname, curcode
-            FROM tr_ibes.statsum_epsint
-            WHERE UPPER(cname) LIKE UPPER(%(name)s)
-            AND curcode = %(cur)s
-            LIMIT 10
-        ''', params={'name': f'%{company_name}%', 'cur': country_code})
+        is_us = country_code == "USD"
+
+        if is_us:
+            # US table doesn't have curcode — search by name or ticker directly
+            result = db.raw_sql('''
+                SELECT DISTINCT ticker, cname, 'USD' as curcode
+                FROM tr_ibes.statsum_epsus
+                WHERE UPPER(cname) LIKE UPPER(%(name)s)
+                LIMIT 10
+            ''', params={'name': f'%{company_name}%'})
+            # Also try exact ticker match
+            if result.empty:
+                result = db.raw_sql('''
+                    SELECT DISTINCT ticker, cname, 'USD' as curcode
+                    FROM tr_ibes.statsum_epsus
+                    WHERE ticker = %(ticker)s
+                    LIMIT 5
+                ''', params={'ticker': company_name.upper()})
+        else:
+            result = db.raw_sql('''
+                SELECT DISTINCT ticker, cname, curcode
+                FROM tr_ibes.statsum_epsint
+                WHERE UPPER(cname) LIKE UPPER(%(name)s)
+                AND curcode = %(cur)s
+                LIMIT 10
+            ''', params={'name': f'%{company_name}%', 'cur': country_code})
+
+        return result
