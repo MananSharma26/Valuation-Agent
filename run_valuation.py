@@ -56,20 +56,41 @@ def find_damodaran_dir() -> pathlib.Path:
     raise FileNotFoundError("Damodaran data not found. Run download_damodaran.sh or check data/damodaran/")
 
 
-def fetch_ibes_consensus(company_name: str, currency: str = "INR") -> dict | None:
-    """Try to fetch I/B/E/S analyst consensus. Returns None if WRDS unavailable."""
+def fetch_ibes_consensus(company_name: str, ticker: str = "", currency: str = "INR") -> dict | None:
+    """Try to fetch I/B/E/S analyst consensus. Returns None if WRDS unavailable.
+
+    Tries multiple name variants since I/B/E/S uses abbreviated names.
+    """
     try:
         from valuation.data.wrds_client import WRDSClient
         w = WRDSClient()
-        results = w.search_ibes_ticker(company_name, country_code=currency)
-        if results is not None and len(results) > 0:
-            ticker = results.iloc[0]["ticker"]
-            estimates = w.fetch_ibes_estimates(ticker)
-            w.close()
-            return {"ticker": ticker, "estimates": estimates, "search_results": results}
+
+        # Try multiple search queries — I/B/E/S uses short names
+        queries = []
+        # Ticker symbol (without exchange suffix)
+        base_ticker = ticker.split(".")[0] if ticker else ""
+        if base_ticker:
+            queries.append(base_ticker)
+        # First two words of company name
+        words = company_name.split()
+        if len(words) >= 2:
+            queries.append(f"{words[0]} {words[1]}")
+        if len(words) >= 1:
+            queries.append(words[0])
+        # Full name as fallback
+        queries.append(company_name)
+
+        for q in queries:
+            results = w.search_ibes_ticker(q, country_code=currency)
+            if results is not None and len(results) > 0:
+                ibes_ticker = results.iloc[0]["ticker"]
+                estimates = w.fetch_ibes_estimates(ibes_ticker)
+                w.close()
+                return {"ticker": ibes_ticker, "estimates": estimates, "search_results": results}
+
         w.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  WRDS error: {e}")
     return None
 
 
@@ -481,7 +502,7 @@ def run(ticker: str, growth_override: float | None = None,
     print(f"\n--- Step 10: Analyst Consensus (comparison only) ---")
     currency_map = {"India": "INR", "US": "USD", "Japan": "JPY", "China": "CNY"}
     currency = currency_map.get(ctx.company.region, "USD")
-    ibes_data = fetch_ibes_consensus(data.name or ticker, currency)
+    ibes_data = fetch_ibes_consensus(data.name or ticker, ticker=ticker, currency=currency)
     if ibes_data and ibes_data.get("estimates") is not None:
         est = ibes_data["estimates"]
         print(f"  I/B/E/S ticker: {ibes_data['ticker']}")
