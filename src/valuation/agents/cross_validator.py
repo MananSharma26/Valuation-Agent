@@ -191,3 +191,59 @@ def cross_validate(
 
     result.flags = flags
     return result
+
+
+def explain_divergence(result: CrossValidationResult, ctx: Any = None) -> str:
+    """Generate a text explanation of model divergence for the report.
+
+    This is deterministic text — the LLM can elaborate on it.
+    """
+    if result.num_models < 2:
+        return ""
+
+    if result.max_divergence_pct < 0.15:
+        return "Models are in strong agreement (divergence < 15%)."
+
+    lines = []
+    vals = result.individual_values
+
+    dcf_val = vals.get("dcf_fcff") or vals.get("dcf_fcfe")
+    rel_val = vals.get("relative_composite")
+
+    if dcf_val and rel_val:
+        if dcf_val < rel_val:
+            lines.append(
+                f"DCF ({dcf_val:,.0f}) is below relative valuation ({rel_val:,.0f})."
+            )
+            lines.append("Possible reasons:")
+            lines.append(
+                "- Our growth/margin assumptions may be conservative vs what the market prices in"
+            )
+            lines.append(
+                "- Industry multiples may be elevated due to sector momentum"
+            )
+            lines.append(
+                "- DCF captures company-specific risk that multiples averaging smooths out"
+            )
+        else:
+            lines.append(
+                f"DCF ({dcf_val:,.0f}) is above relative valuation ({rel_val:,.0f})."
+            )
+            lines.append("Possible reasons:")
+            lines.append(
+                "- Our growth assumptions may be more optimistic than the market"
+            )
+            lines.append(
+                "- Industry multiples may be depressed (sector rotation, sentiment)"
+            )
+            lines.append(
+                "- Company may have competitive advantages not reflected in peer multiples"
+            )
+
+    if result.max_divergence_pct > 0.40:
+        lines.append("")
+        lines.append(
+            f"High divergence ({result.max_divergence_pct:.0%}) — treat valuation range with caution."
+        )
+
+    return "\n".join(lines)

@@ -350,6 +350,15 @@ def _section_key_assumptions(ctx: ValuationContext) -> str:
             ))
         lines.append(_md_table(["Parameter", "Original", "Override", "Reason"], ov_rows))
 
+    # Assumption reviews/flags
+    reviews = ctx.financials.key_stats.get("assumption_reviews") or []
+    if reviews:
+        from valuation.agents.assumption_reviewer import format_review_for_report
+        review_text = format_review_for_report(reviews)
+        if review_text:
+            lines.append("")
+            lines.append(review_text)
+
     return "\n".join(lines)
 
 
@@ -512,6 +521,16 @@ def _section_cross_validation(ctx: ValuationContext) -> str:
             ]
 
         lines = ["## Cross-Validation", "", _md_table(["Model", "Implied Value per Share"], rows)]
+
+        # Divergence explanation
+        explanation = ctx.financials.key_stats.get("divergence_explanation") if ctx.financials.key_stats else None
+        if explanation:
+            lines.append("")
+            lines.append("**Model Divergence Analysis:**")
+            lines.append("")
+            for line in explanation.splitlines():
+                lines.append(line)
+
         return "\n".join(lines)
 
     # Full CrossValidationResult dict
@@ -548,6 +567,15 @@ def _section_cross_validation(ctx: ValuationContext) -> str:
         lines.append("")
         for flag in flags:
             lines.append(f"- {flag}")
+
+    # Divergence explanation
+    explanation = ctx.financials.key_stats.get("divergence_explanation") if ctx.financials.key_stats else None
+    if explanation:
+        lines.append("")
+        lines.append("**Model Divergence Analysis:**")
+        lines.append("")
+        for line in explanation.splitlines():
+            lines.append(line)
 
     return "\n".join(lines)
 

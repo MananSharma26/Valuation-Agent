@@ -415,6 +415,23 @@ def run(ticker: str, growth_override: float | None = None,
         sys.exit(1)
 
     # ================================================================
+    # STEP 7.5: Assumption Review
+    # ================================================================
+    print(f"\n--- Step 7.5: Assumption Review ---")
+    from valuation.agents.assumption_reviewer import review_assumptions, format_review_for_report
+
+    reviews = review_assumptions(ctx)
+    ctx.financials.key_stats["assumption_reviews"] = reviews
+
+    warnings_7 = [r for r in reviews if r["severity"] in ("warning", "critical")]
+    if warnings_7:
+        for r in warnings_7:
+            icon = "✗" if r["severity"] == "critical" else "⚠"
+            print(f"  {icon} {r['field']}: {r['comment']}")
+    else:
+        print(f"  All assumptions within expected ranges")
+
+    # ================================================================
     # STEP 8: Run Valuation Engines
     # ================================================================
     print(f"\n--- Step 8: Valuation Engines ---")
@@ -714,6 +731,13 @@ def run(ticker: str, growth_override: float | None = None,
             print(f"  Max Divergence: {cv.max_divergence_pct:.1%}")
     for f in cv.flags:
         print(f"  ⚠ {f}")
+
+    from valuation.agents.cross_validator import explain_divergence
+    divergence_explanation = explain_divergence(cv, ctx)
+    if divergence_explanation:
+        for line in divergence_explanation.splitlines():
+            print(f"  {line}")
+    ctx.financials.key_stats["divergence_explanation"] = divergence_explanation
 
     # ================================================================
     # STEP 12: Confidence Scoring
