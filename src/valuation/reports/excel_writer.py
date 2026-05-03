@@ -185,6 +185,14 @@ def generate_excel(
 
     output_path = pathlib.Path(output_path)
 
+    # If file is locked (e.g., open in Excel), add a suffix
+    if output_path.exists():
+        try:
+            output_path.unlink()
+        except PermissionError:
+            stem = output_path.stem
+            output_path = output_path.with_name(f"{stem}_{date.today().strftime('%H%M%S')}.xlsx")
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         _write_summary(writer, ctx)
         _write_assumptions(writer, ctx)
