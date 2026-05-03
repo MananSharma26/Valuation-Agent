@@ -68,11 +68,24 @@ def _extract_values(model_outputs: dict[str, dict]) -> dict[str, float]:
                     break
 
         elif model_name == "relative":
+            # Check both naming conventions
+            rel_keys = {
+                "pe_value": "relative_pe",
+                "ev_ebitda_value": "relative_ev_ebitda",
+                "pbv_value": "relative_pbv",
+                "ps_value": "relative_ps",
+                "composite_value": "relative_composite",
+            }
+            for key, label in rel_keys.items():
+                if key in output and output[key] is not None:
+                    fval = float(output[key])
+                    if fval > 0:
+                        values[label] = fval
+            # Also check implied_value_ prefix
             for key, val in output.items():
                 if key.startswith("implied_value_") and isinstance(val, (int, float)):
                     fval = float(val)
                     if fval > 0:
-                        # e.g. "implied_value_pe" -> "relative_pe"
                         suffix = key.replace("implied_value_", "")
                         values[f"relative_{suffix}"] = fval
 
