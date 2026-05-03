@@ -26,6 +26,33 @@ _STOPWORDS: frozenset[str] = frozenset(
     {"and", "or", "the", "a", "an", "of", "for", "in", "&", "-"}
 )
 
+# Common yfinance industry → Damodaran industry overrides.
+# Checked BEFORE fuzzy matching to prevent well-known mismatches.
+_INDUSTRY_OVERRIDES: dict[str, str] = {
+    "Information Technology Services": "Computer Services",
+    "Software - Application": "Software (System & Application)",
+    "Software - Infrastructure": "Software (System & Application)",
+    "Semiconductors": "Semiconductor",
+    "Semiconductor Equipment & Materials": "Semiconductor Equip",
+    "Banks - Diversified": "Bank (Money Center)",
+    "Banks - Regional": "Banks (Regional)",
+    "Drug Manufacturers - General": "Drugs (Pharmaceutical)",
+    "Drug Manufacturers - Specialty & Generic": "Drugs (Pharmaceutical)",
+    "Biotechnology": "Drugs (Biotechnology)",
+    "Oil & Gas E&P": "Oil/Gas (Production and Exploration)",
+    "Oil & Gas Integrated": "Oil/Gas (Integrated)",
+    "Oil & Gas Equipment & Services": "Oilfield Svcs/Equip.",
+    "Auto Manufacturers": "Auto & Truck",
+    "Auto Parts": "Auto Parts",
+    "Internet Content & Information": "Software (Internet)",
+    "Internet Retail": "Retail (Online)",
+    "Consumer Electronics": "Computers/Peripherals",
+    "Insurance - Diversified": "Insurance (General)",
+    "Insurance - Life": "Insurance (Life)",
+    "Asset Management": "Financial Svcs. (Non-bank & Insurance)",
+    "Capital Markets": "Brokerage & Investment Banking",
+}
+
 
 @dataclass
 class IndustryMatch:
@@ -51,6 +78,53 @@ def _adjusted_score(query: str, candidate: str, base_score: int) -> int:
     if c_words <= 1 and q_words >= 2:
         return int(base_score * 0.6)
     return base_score
+
+
+def validate_match(matched_name: str, sector: str, industry: str) -> str | None:
+    """Return a better Damodaran industry name if the fuzzy match seems wrong.
+
+    Applies heuristic rules for common mismatches. Returns None when the
+    current match looks correct.
+
+    Parameters
+    ----------
+    matched_name : str
+        The industry name returned by fuzzy matching.
+    sector : str
+        Company sector from yfinance.
+    industry : str
+        Company industry from yfinance.
+
+    Returns
+    -------
+    str or None
+        A suggested replacement name, or None if the match looks OK.
+    """
+    sector_lower = (sector or "").lower()
+    industry_lower = (industry or "").lower()
+    matched_lower = matched_name.lower()
+
+    # Tech companies shouldn't match to "Information Services" (that's news/data agencies)
+    if "information services" in matched_lower:
+        if (
+            "technology" in sector_lower
+            or "software" in industry_lower
+            or "it " in industry_lower
+            or industry_lower.startswith("it")
+        ):
+            return "Computer Services"
+
+    # Financial companies shouldn't match to non-financial industries
+    if "financial" in sector_lower or "bank" in industry_lower:
+        if (
+            "bank" not in matched_lower
+            and "financial" not in matched_lower
+            and "insurance" not in matched_lower
+        ):
+            if "bank" in industry_lower:
+                return "Bank (Money Center)"
+
+    return None  # match looks OK
 
 
 def match_industry(
@@ -87,6 +161,16 @@ def match_industry(
     industry_names = loader.list_industries(region=region)
     if not industry_names:
         return None
+
+    # Step 0: Check exact override table before any fuzzy matching
+    if industry and industry in _INDUSTRY_OVERRIDES:
+        override_name = _INDUSTRY_OVERRIDES[industry]
+        if override_name in industry_names:
+            return IndustryMatch(
+                matched_name=override_name,
+                score=100,
+                candidates=[(override_name, 100)],
+            )
 
     # Build query strings to try
     queries: list[str] = []
@@ -145,6 +229,15 @@ def match_industry(
 
     if best_score < threshold:
         return None
+
+    # Step 7: Validate the fuzzy result — catch common semantic mismatches
+    better = validate_match(best_name, sector, industry)
+    if better and better in industry_names:
+        return IndustryMatch(
+            matched_name=better,
+            score=95,
+            candidates=sorted_candidates,
+        )
 
     return IndustryMatch(
         matched_name=best_name,
