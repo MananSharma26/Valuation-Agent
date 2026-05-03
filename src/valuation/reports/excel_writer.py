@@ -446,51 +446,242 @@ def _write_assumptions(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 
 
 def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
-    """Sheet 3: DCF year-by-year projections."""
+    """Sheet 3: DCF year-by-year projections — full Damodaran-style calculation flow."""
     if ctx.outputs.dcf_fcff:
         d = ctx.outputs.dcf_fcff
-        n = len(d.get("yearly_fcff", []))
+        a = ctx.assumptions
 
-        rows = {
-            "Year": list(range(1, n + 1)),
-            "EBIT(1-t)": d.get("yearly_ebit_at", []),
-            "FCFF": d.get("yearly_fcff", []),
-            "PV of FCFF": d.get("yearly_pv", []),
-        }
+        yearly_revenue = d.get("yearly_revenue", [])
+        yearly_ebit = d.get("yearly_ebit", [])
+        yearly_ebit_at = d.get("yearly_ebit_at", [])
+        yearly_reinvestment = d.get("yearly_reinvestment", [])
+        yearly_fcff = d.get("yearly_fcff", [])
+        yearly_pv = d.get("yearly_pv", [])
+        n = len(yearly_fcff)
+
+        # Detect v2 (revenue-based) vs v1 (ebit-based) by presence of yearly_revenue
+        is_v2 = bool(yearly_revenue)
+
+        if is_v2:
+            # --- Reconstruct per-year schedules from output data ---
+            base_revenue = d.get("base_revenue")
+            base_ebit = d.get("base_ebit")
+
+            # Back-calculate base revenue from first projection year + growth rate
+            if base_revenue is None and yearly_revenue and a.growth_rates:
+                g0 = a.growth_rates[0]
+                base_revenue = yearly_revenue[0] / (1 + g0) if g0 != -1 else yearly_revenue[0]
+
+            # Revenue growth rates per year (derived from data)
+            rev_growth: list = []
+            for t in range(n):
+                prev = base_revenue if t == 0 else yearly_revenue[t - 1]
+                if prev and prev != 0:
+                    rev_growth.append(yearly_revenue[t] / prev - 1)
+                elif a.growth_rates and t < len(a.growth_rates):
+                    rev_growth.append(a.growth_rates[t])
+                else:
+                    rev_growth.append("")
+
+            # Operating margin per year: ebit / revenue
+            op_margins: list = []
+            for t in range(n):
+                rev = yearly_revenue[t] if t < len(yearly_revenue) else 0
+                ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
+                if rev and rev != 0:
+                    op_margins.append(ebt / rev)
+                else:
+                    op_margins.append("")
+
+            # Tax rate per year: 1 - ebit_at / ebit
+            tax_rates_y: list = []
+            for t in range(n):
+                ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
+                ebt_at = yearly_ebit_at[t] if t < len(yearly_ebit_at) else 0
+                if ebt and ebt != 0:
+                    tax_rates_y.append(1 - ebt_at / ebt)
+                else:
+                    tax_rates_y.append(a.tax_rate if a.tax_rate is not None else "")
+
+            # Cumulated discount factor: |fcff / pv|
+            cum_discount: list = []
+            for t in range(n):
+                fcff_t = yearly_fcff[t] if t < len(yearly_fcff) else 0
+                pv_t = yearly_pv[t] if t < len(yearly_pv) else 0
+                if fcff_t and fcff_t != 0 and pv_t and pv_t != 0:
+                    cum_discount.append(abs(fcff_t / pv_t))
+                else:
+                    cum_discount.append("")
+
+            # Per-year WACC: cum[t]/cum[t-1] - 1
+            wacc_y: list = []
+            for t in range(n):
+                cd = cum_discount[t]
+                if isinstance(cd, float):
+                    if t == 0:
+                        wacc_y.append(cd - 1)
+                    else:
+                        prev_cd = cum_discount[t - 1]
+                        if isinstance(prev_cd, float) and prev_cd != 0:
+                            wacc_y.append(cd / prev_cd - 1)
+                        else:
+                            wacc_y.append(a.wacc if a.wacc is not None else "")
+                else:
+                    wacc_y.append(a.wacc if a.wacc is not None else "")
+
+            # Terminal period values
+            terminal_growth = a.terminal_growth
+            terminal_margin = op_margins[-1] if op_margins and isinstance(op_margins[-1], float) else ""
+            terminal_tax = a.tax_rate if a.tax_rate is not None else (
+                tax_rates_y[-1] if tax_rates_y and isinstance(tax_rates_y[-1], float) else ""
+            )
+            base_margin = (base_ebit / base_revenue) if (base_ebit is not None and base_revenue) else ""
+            base_ebit_at = (base_ebit * (1 - a.tax_rate)) if (base_ebit is not None and a.tax_rate is not None) else ""
+
+            def _yr_vals(lst: list) -> list:
+                """Pad/trim list to exactly n elements as _safe values."""
+                return [_safe(lst[t]) if t < len(lst) else "" for t in range(n)]
+
+            def _make_row(label: str, base_val, yearly_vals: list, terminal_val="") -> list:
+                row = [label, _safe(base_val)] + _yr_vals(yearly_vals) + [_safe(terminal_val)]
+                return row
+
+            rows: list = []
+
+            # Year-label header row
+            rows.append([""] + ["Base"] + [str(t + 1) for t in range(n)] + ["Terminal"])
+
+            # REVENUE PROJECTIONS block
+            rows.append(["REVENUE PROJECTIONS"] + [""] * (n + 2))
+            rows.append(_make_row("Revenue Growth Rate", "", rev_growth, terminal_growth))
+            rows.append(_make_row("Revenues", base_revenue, yearly_revenue, ""))
+            rows.append(_make_row("Operating Margin", base_margin, op_margins, terminal_margin))
+            rows.append(_make_row("Operating Income (EBIT)", base_ebit, yearly_ebit, ""))
+
+            # TAX & REINVESTMENT block
+            rows.append([""] + [""] * (n + 2))
+            rows.append(["TAX & REINVESTMENT"] + [""] * (n + 2))
+            rows.append(_make_row("Tax Rate", a.tax_rate, tax_rates_y, terminal_tax))
+            rows.append(_make_row("EBIT(1-t)", base_ebit_at, yearly_ebit_at, ""))
+            rows.append(_make_row("- Reinvestment", "", yearly_reinvestment, ""))
+            rows.append(_make_row("= FCFF", "", yearly_fcff, _safe(d.get("terminal_fcff"))))
+
+            # DISCOUNT RATES block
+            rows.append([""] + [""] * (n + 2))
+            rows.append(["DISCOUNT RATES"] + [""] * (n + 2))
+            rows.append(_make_row("Cost of Capital (WACC)", a.wacc, wacc_y, ""))
+            rows.append(_make_row("Cumulated Discount Factor", "", cum_discount, ""))
+            rows.append(_make_row("PV(FCFF)", "", yearly_pv, ""))
+
+            # TERMINAL VALUE block
+            rows.append([""] + [""] * (n + 2))
+            rows.append(["TERMINAL VALUE"] + [""] * (n + 2))
+            # Terminal value and PV go in the Terminal column (last column)
+            rows.append(["Terminal Value"] + [""] * (n + 1) + [_safe(d.get("terminal_value"))])
+            rows.append(["PV(Terminal Value)"] + [""] * (n + 1) + [_safe(d.get("pv_terminal"))])
+
+            # EQUITY VALUE BRIDGE block
+            price = ctx.financials.key_stats.get("price")
+            shares = ctx.financials.key_stats.get("shares_outstanding")
+            vps = d.get("equity_value_per_share")
+            upside = (vps - price) / price if (vps and price and price > 0) else None
+
+            rows.append([""] + [""] * (n + 2))
+            rows.append(["EQUITY VALUE BRIDGE"] + [""] * (n + 2))
+            for label, val in [
+                ("Value of Operating Assets", d.get("enterprise_value")),
+                ("+ Cash", d.get("cash")),
+                ("- Debt", d.get("debt")),
+                ("+ Non-operating Assets", d.get("non_operating_assets")),
+                ("= Value of Equity", d.get("equity_value")),
+                ("/ Shares Outstanding", shares),
+                ("= Value per Share", vps),
+                ("Market Price", price),
+                ("% Under / Over Valued", upside),
+            ]:
+                rows.append([label, _safe(val)] + [""] * (n + 1))
+
+        else:
+            # --- v1 fallback: EBIT-driven (no revenue data) ---
+            rows = [[""] + [str(t + 1) for t in range(n)] + ["Terminal"]]
+            rows.append(["EBIT(1-t)"] + [_safe(v) for v in yearly_ebit_at] + [""])
+            rows.append(["FCFF"] + [_safe(v) for v in yearly_fcff] + [_safe(d.get("terminal_value"))])
+            rows.append(["PV of FCFF"] + [_safe(v) for v in yearly_pv] + [_safe(d.get("pv_terminal"))])
+            rows.append([""] * (n + 2))
+            rows.append(["PV of High-Growth Phase", _safe(d.get("pv_high_growth"))] + [""] * (n + 1))
+            rows.append(["PV of Terminal Value", _safe(d.get("pv_terminal"))] + [""] * (n + 1))
+            rows.append(["Enterprise Value", _safe(d.get("enterprise_value"))] + [""] * (n + 1))
+            rows.append(["Equity Value", _safe(d.get("equity_value"))] + [""] * (n + 1))
+            rows.append(["Value per Share", _safe(d.get("equity_value_per_share"))] + [""] * (n + 1))
+
+        max_cols = max(len(r) for r in rows)
+        for r in rows:
+            while len(r) < max_cols:
+                r.append("")
+
         df = pd.DataFrame(rows)
-
-        summary = pd.DataFrame([
-            {"Year": "", "EBIT(1-t)": "", "FCFF": "", "PV of FCFF": ""},
-            {"Year": "PV of High-Growth", "EBIT(1-t)": "", "FCFF": "", "PV of FCFF": d.get("pv_high_growth")},
-            {"Year": "Terminal Value", "EBIT(1-t)": "", "FCFF": d.get("terminal_value"), "PV of FCFF": d.get("pv_terminal")},
-            {"Year": "Enterprise Value", "EBIT(1-t)": "", "FCFF": "", "PV of FCFF": d.get("enterprise_value")},
-            {"Year": "Equity Value", "EBIT(1-t)": "", "FCFF": "", "PV of FCFF": d.get("equity_value")},
-            {"Year": "Value per Share", "EBIT(1-t)": "", "FCFF": "", "PV of FCFF": d.get("equity_value_per_share")},
-        ])
-        df = pd.concat([df, summary], ignore_index=True)
-        df.to_excel(writer, sheet_name="DCF Model", index=False)
+        df.to_excel(writer, sheet_name="DCF Model", index=False, header=False)
 
         ws = _ws(writer, "DCF Model")
-        _style_header_row(ws, 1, 4)
 
-        for row_idx in range(2, ws.max_row + 1):
-            year_cell = ws.cell(row=row_idx, column=1)
-            year_val = year_cell.value
-            # Summary label rows
-            if isinstance(year_val, str) and year_val.strip():
-                year_cell.font = _BOLD_FONT
-            for col_idx in range(2, 5):
+        _pct_labels_dcf = {
+            "revenue growth rate", "operating margin", "tax rate",
+            "cost of capital (wacc)",
+        }
+        _price_labels_dcf = {"= value per share", "market price"}
+        _factor_labels_dcf = {"cumulated discount factor"}
+        _section_labels_dcf = {
+            "revenue projections", "tax & reinvestment",
+            "discount rates", "terminal value", "equity value bridge",
+        }
+
+        for row_idx in range(1, ws.max_row + 1):
+            label_cell = ws.cell(row=row_idx, column=1)
+            label_raw = label_cell.value or ""
+            label_lower = str(label_raw).strip().lower()
+
+            # Year-label header row (row 1)
+            if row_idx == 1:
+                _style_header_row(ws, row_idx, max_cols)
+                continue
+
+            # Blank separator rows
+            if label_lower == "":
+                continue
+
+            # Section title rows
+            if label_lower in _section_labels_dcf:
+                _style_section_title(ws, row_idx, max_cols)
+                continue
+
+            label_cell.font = _BOLD_FONT
+            label_cell.alignment = _LEFT
+
+            for col_idx in range(2, max_cols + 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
-                if isinstance(cell.value, (int, float)):
-                    # Value per Share uses price format; others use large-number format
-                    if isinstance(year_val, str) and "per share" in str(year_val).lower():
-                        cell.number_format = _FMT_PRICE
-                    else:
-                        cell.number_format = _FMT_INT
-                    cell.alignment = _RIGHT
+                val = cell.value
+                if not isinstance(val, (int, float)):
+                    continue
 
-        _autofit_columns(ws, min_label_width=20)
-        _freeze_top_row(ws)
+                if label_lower in _pct_labels_dcf and abs(val) <= 3:
+                    cell.number_format = _FMT_PCT
+                elif label_lower in _price_labels_dcf:
+                    cell.number_format = _FMT_PRICE
+                elif label_lower in _factor_labels_dcf:
+                    cell.number_format = "#,##0.000"
+                elif label_lower == "% under / over valued":
+                    cell.number_format = _FMT_PCT
+                    _apply_upside_color(cell)
+                else:
+                    cell.number_format = _FMT_INT
+                cell.alignment = _RIGHT
+
+        # Column widths
+        ws.column_dimensions["A"].width = 30
+        for col_idx in range(2, max_cols + 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = 15
+
+        ws.freeze_panes = "B2"
 
     elif ctx.outputs.dcf_fcfe:
         d = ctx.outputs.dcf_fcfe
@@ -1011,6 +1202,57 @@ def _write_data_sources(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
     _freeze_top_row(ws)
 
 
+_IS_COL_ORDER: dict[str, list[str]] = {
+    "Income Statement": [
+        "Total Revenue", "Cost Of Revenue", "Gross Profit",
+        "Operating Expense", "Selling General And Administration", "Research And Development",
+        "Operating Income", "Interest Expense", "Other Income Expense",
+        "Pretax Income", "Tax Provision", "Net Income",
+        "EBITDA", "EBIT", "Basic EPS", "Diluted EPS",
+    ],
+    "Balance Sheet": [
+        "Cash And Cash Equivalents", "Current Assets", "Total Assets",
+        "Current Liabilities", "Long Term Debt", "Total Debt", "Total Liabilities",
+        "Total Stockholders Equity", "Share Issued",
+    ],
+    "Cash Flow": [
+        "Operating Cash Flow", "Capital Expenditure", "Free Cash Flow",
+        "Depreciation And Amortization", "Stock Based Compensation",
+        "Change In Working Capital", "Investing Cash Flow", "Financing Cash Flow",
+    ],
+}
+
+
+def _reorder_financial_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+    """Reorder rows (line items) of a financial statement DataFrame into standard order.
+
+    Rows whose index label matches a known canonical name are placed first in the
+    prescribed order; any remaining rows are appended afterward.
+    """
+    canonical = _IS_COL_ORDER.get(sheet_name, [])
+    if not canonical:
+        return df
+
+    # Build a case-insensitive lookup: lower(label) → original index label
+    existing = {str(idx).lower(): idx for idx in df.index}
+
+    ordered_idx: list = []
+    seen: set = set()
+    for name in canonical:
+        key = name.lower()
+        if key in existing:
+            orig = existing[key]
+            ordered_idx.append(orig)
+            seen.add(orig)
+
+    # Append any remaining rows not in the canonical list
+    for idx in df.index:
+        if idx not in seen:
+            ordered_idx.append(idx)
+
+    return df.loc[ordered_idx]
+
+
 def _write_financials(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
     """Sheet 8: Raw financial statements — rows=line items, columns=fiscal years."""
     sheets = [
@@ -1047,6 +1289,9 @@ def _write_financials(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
             df = df.sort_index(axis=1, ascending=False)
         except TypeError:
             pass  # Mixed types in columns; skip sort
+
+        # Reorder rows into standard reporting order
+        df = _reorder_financial_rows(df, sheet_name)
 
         # Write to Excel
         df.to_excel(writer, sheet_name=sheet_name)
