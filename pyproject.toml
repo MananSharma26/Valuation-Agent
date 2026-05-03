@@ -20,6 +20,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "network: marks tests that require internet access (deselect with '-m not network')",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]
