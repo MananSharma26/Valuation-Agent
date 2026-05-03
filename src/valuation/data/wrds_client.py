@@ -13,8 +13,20 @@ class WRDSClient:
         self._db = None
 
     def _connect(self):
-        """Lazy connection to WRDS."""
+        """Lazy connection to WRDS. Reads credentials from ~/.pgpass."""
         if self._db is None:
+            import os
+            import pathlib
+
+            # Read password from .pgpass so WRDS doesn't prompt interactively
+            pgpass = pathlib.Path.home() / ".pgpass"
+            if pgpass.exists() and "PGPASSWORD" not in os.environ:
+                for line in pgpass.read_text().strip().splitlines():
+                    parts = line.split(":")
+                    if len(parts) >= 5 and "wrds" in parts[0]:
+                        os.environ["PGPASSWORD"] = parts[4]
+                        break
+
             import wrds
             self._db = wrds.Connection(wrds_username=self._username)
         return self._db
