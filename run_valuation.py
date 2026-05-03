@@ -173,6 +173,11 @@ def run(ticker: str, growth_override: float | None = None,
     cl = classify_company(ctx)
     if classification_override:
         ctx.company.classification = classification_override
+        ctx.assumptions.overrides["classification"] = {
+            "original": cl.classification,
+            "new": classification_override,
+            "reason": "CLI override",
+        }
         print(f"  Override: {classification_override} (original: {cl.classification})")
     else:
         ctx.company.classification = cl.classification
@@ -265,21 +270,77 @@ def run(ticker: str, growth_override: float | None = None,
     default_terminal = 0.05 if is_india else 0.025
     terminal_growth = terminal_override if terminal_override is not None else default_terminal
 
+    if terminal_override is not None:
+        ctx.assumptions.set_override("terminal_growth", terminal_growth,
+            f"CLI override: terminal growth set to {terminal_override}")
+
+    # Smart growth selection (Damodaran hierarchy)
+    rev_g = growth_dict.get("historical_revenue")
+    ni_g = growth_dict.get("historical_net_income")
+
+    # Fundamental growth recomputed from local roe/retention for selection logic
+    fundamental = roe * retention if roe > 0 and retention > 0 else None
+
+    # Industry benchmark
+    industry_g = (
+        ctx.benchmarks.industry_growth.get("expected_growth_5y")
+        if ctx.benchmarks.industry_growth
+        else None
+    )
+
+    # Build candidate dict for display
+    candidates: dict[str, float] = {}
+    if rev_g and rev_g.value > 0:
+        candidates["historical_revenue"] = rev_g.value
+    if ni_g and ni_g.value > 0:
+        candidates["historical_net_income"] = ni_g.value
+    if fundamental and fundamental > 0:
+        candidates["fundamental_roe_x_retention"] = fundamental
+
     if growth_override is not None:
         high_growth = growth_override
-    else:
-        rev_g = growth_dict.get("historical_revenue")
-        if rev_g and rev_g.value > 0:
-            high_growth = min(rev_g.value, 0.25)
-        elif fundamental_growth > 0:
-            high_growth = min(fundamental_growth, 0.25)
+        print(f"  Growth override: {high_growth:.2%}")
+    elif ctx.company.classification == "growth":
+        # Growth companies: use higher of fundamental and revenue CAGR
+        if fundamental and fundamental > 0:
+            high_growth = max(fundamental, candidates.get("historical_revenue", 0))
+        elif "historical_revenue" in candidates:
+            high_growth = candidates["historical_revenue"]
         else:
-            high_growth = 0.08
+            high_growth = 0.10
+        # Cap at industry * 1.5 or 25%
+        if industry_g and industry_g > 0:
+            high_growth = min(high_growth, industry_g * 1.5)
+        high_growth = min(high_growth, 0.25)
+        print(f"  Selected: {high_growth:.2%} (growth company — higher of fundamental/historical, capped)")
+    elif ctx.company.classification == "mature":
+        # Mature companies: fundamental growth is most sustainable
+        if fundamental and fundamental > 0:
+            high_growth = fundamental
+        elif "historical_revenue" in candidates:
+            high_growth = candidates["historical_revenue"]
+        else:
+            high_growth = 0.05
+        high_growth = min(high_growth, 0.15)  # mature companies rarely grow > 15%
+        print(f"  Selected: {high_growth:.2%} (mature company — fundamental preferred)")
+    else:
+        # Default: use revenue CAGR
+        high_growth = candidates.get("historical_revenue", 0.08)
+        high_growth = max(min(high_growth, 0.25), 0.02)
+        print(f"  Selected: {high_growth:.2%} (default — revenue CAGR)")
+
+    print(f"  Candidates: {', '.join(f'{k}={v:.2%}' for k, v in candidates.items())}")
+    if industry_g:
+        print(f"  Industry benchmark: {industry_g:.2%}")
 
     growth_rates = interpolate_params(high_growth, terminal_growth, n_years, gradual=True)
     ctx.assumptions.growth_rates = growth_rates
     ctx.assumptions.terminal_growth = terminal_growth
     ctx.assumptions.projection_years = n_years
+
+    if growth_override is not None:
+        ctx.assumptions.set_override("growth_rates", growth_rates,
+            f"CLI override: high growth set to {growth_override:.2%}")
 
     print(f"\n  → Using: {high_growth:.2%} high-growth → {terminal_growth:.2%} terminal over {n_years} years")
 
@@ -415,6 +476,22 @@ def run(ticker: str, growth_override: float | None = None,
         ctx.outputs.dcf_fcff = fcff_result
         print(f"  [FCFF DCF v2] Value/Share: {fcff_result['equity_value_per_share']:,.2f}")
         print(f"    EV: {fcff_result['enterprise_value']:,.0f} | PV HG: {fcff_result['pv_high_growth']:,.0f} | PV TV: {fcff_result['pv_terminal']:,.0f}")
+
+        # Also run Gordon Growth for stable dividend-paying companies
+        if (ctx.company.classification == "mature"
+                and data.dividend_per_share and data.dividend_per_share > 0
+                and ctx.assumptions.cost_of_equity and ctx.assumptions.terminal_growth):
+            try:
+                gg_value = gordon_growth_value(
+                    current_dividend=data.dividend_per_share,
+                    cost_of_equity=ctx.assumptions.cost_of_equity,
+                    growth_rate=ctx.assumptions.terminal_growth,
+                )
+                if not ctx.outputs.dcf_fcfe:
+                    ctx.outputs.dcf_fcfe = {"value_per_share": gg_value, "model": "gordon_growth"}
+                print(f"  [Gordon Growth] Value/Share: {gg_value:,.2f}")
+            except (ValueError, ZeroDivisionError):
+                pass
 
     # Relative valuation (always run)
     eps = net_income / data.shares_outstanding if data.shares_outstanding > 0 else 0
