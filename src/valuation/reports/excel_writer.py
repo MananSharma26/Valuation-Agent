@@ -117,10 +117,17 @@ def _is_section_title(val: Any) -> bool:
 def _is_pct_label(label: str) -> bool:
     """Return True if the label suggests the value is a percentage."""
     label_lower = label.lower() if isinstance(label, str) else ""
-    pct_keywords = ("rate", "growth", "yield", "wacc", "beta", "margin",
+    # Beta, D/E, S2C, PEG are ratios, NOT percentages
+    non_pct = ("beta", "d/e", "sales to capital", "peg", "pe ", "pbv",
+               "ev_ebitda", "ev_ebit", "ev_sales", "ev_invested", "current_pe",
+               "trailing_pe", "forward_pe")
+    if any(kw in label_lower for kw in non_pct):
+        return False
+    pct_keywords = ("rate", "growth", "yield", "wacc", "margin",
                     "upside", "downside", "completeness", "agreement",
                     "sensitivity", "score", "coverage", "premium", "discount",
-                    "equity", "cost of")
+                    "cost of equity", "cost of debt", "cost of capital",
+                    "roe", "roic", "roc")
     return any(kw in label_lower for kw in pct_keywords)
 
 
