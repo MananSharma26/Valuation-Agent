@@ -369,11 +369,14 @@ def run(ticker: str, growth_override: float | None = None,
             pass
 
     # Priority: Live Treasury (US only) → Damodaran → hardcoded
+    # For non-US: local currency Rf = US Rf + CRP (Damodaran approach)
+    # This embeds country risk into Rf, so CRP is set to 0 separately
     if is_india:
-        rf = damodaran_rf or 0.07  # US Rf as base, add CRP separately
-        crp = damodaran_crp or 0.032  # India CRP from Damodaran
-        lam = 0.5  # IT exports ~50% revenue
-        print(f"  Rf: {rf:.2%} (Damodaran T-Bond) | CRP: {crp:.2%} (India) | Lambda: {lam}")
+        us_rf = damodaran_rf or 0.0418
+        rf = us_rf + (damodaran_crp or 0.032)  # ~7.4% = local currency Rf
+        crp = 0.0  # already embedded in local Rf
+        lam = 1.0  # irrelevant since CRP=0
+        print(f"  Rf: {rf:.2%} (India local currency: US Rf {us_rf:.2%} + CRP {damodaran_crp:.2%})")
     elif is_japan:
         rf = 0.01  # Japan has its own yield curve
         crp = damodaran_crp or 0.0
