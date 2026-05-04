@@ -334,26 +334,66 @@ def run(ticker: str, growth_override: float | None = None,
 
     is_india = ctx.company.region == "India"
     is_japan = ctx.company.region == "Japan"
-
-    # Use live Treasury yield from macro context if available, else hardcoded fallback
     macro = ctx.financials.key_stats.get("macro_context") or {}
     live_rf = macro.get("us_10yr_yield")
 
-    if is_india:
-        rf = 0.07  # India 10yr govt bond — no live source yet
-    elif is_japan:
-        rf = 0.01
-    elif live_rf and 0.01 < live_rf < 0.10:
-        rf = live_rf
-        print(f"  Using live US 10yr yield: {rf:.2%} (from Yahoo Finance ^TNX)")
-    else:
-        rf = 0.0395  # fallback
-        if live_rf:
-            print(f"  Live yield {live_rf:.2%} out of range, using fallback {rf:.2%}")
+    # --- Risk-free rate: Live Treasury → Damodaran data → hardcoded fallback ---
+    # Read Damodaran's latest T-Bond rate and implied ERP from histimpl.xls
+    damodaran_rf = None
+    damodaran_erp = None
+    try:
+        df_impl = loader.load("histimpl", "US")
+        tbond_cols = [c for c in df_impl.columns if "T.Bond Rate" in c]
+        if tbond_cols:
+            damodaran_rf = float(df_impl[tbond_cols[0]].dropna().iloc[-1])
+        erp_cols = [c for c in df_impl.columns if "risk adjusted" in c.lower() and "erp" in c.lower()]
+        if not erp_cols:
+            erp_cols = [c for c in df_impl.columns if "Implied ERP (FCFE)" in c]
+        if erp_cols:
+            damodaran_erp = float(df_impl[erp_cols[0]].dropna().iloc[-1])
+    except Exception:
+        pass
 
-    erp = 0.0446
-    crp = 0.0  # embedded in local Rf for India
-    lam = 0.5 if is_india else 1.0
+    # Country risk premium from ctryprem.xlsx
+    damodaran_crp = 0.0
+    country_name = ctx.financials.key_stats.get("country") or ""
+    if country_name and country_name != "United States":
+        try:
+            df_crp = loader.load("ctryprem", "Global")
+            country_col = [c for c in df_crp.columns if "country" in c.lower()][0]
+            crp_col = [c for c in df_crp.columns if c == "Country Risk Premium"][0]
+            row = df_crp[df_crp[country_col].str.contains(country_name, case=False, na=False)]
+            if len(row) > 0:
+                damodaran_crp = float(row.iloc[0][crp_col])
+        except Exception:
+            pass
+
+    # Priority: Live Treasury (US only) → Damodaran → hardcoded
+    if is_india:
+        rf = damodaran_rf or 0.07  # US Rf as base, add CRP separately
+        crp = damodaran_crp or 0.032  # India CRP from Damodaran
+        lam = 0.5  # IT exports ~50% revenue
+        print(f"  Rf: {rf:.2%} (Damodaran T-Bond) | CRP: {crp:.2%} (India) | Lambda: {lam}")
+    elif is_japan:
+        rf = 0.01  # Japan has its own yield curve
+        crp = damodaran_crp or 0.0
+        lam = 1.0
+    else:
+        # US: prefer live Treasury, fallback to Damodaran
+        if live_rf and 0.01 < live_rf < 0.10:
+            rf = live_rf
+            print(f"  Rf: {rf:.2%} (live US 10yr from Yahoo Finance)")
+        elif damodaran_rf:
+            rf = damodaran_rf
+            print(f"  Rf: {rf:.2%} (Damodaran histimpl.xls)")
+        else:
+            rf = 0.0395
+            print(f"  Rf: {rf:.2%} (hardcoded fallback)")
+        crp = damodaran_crp
+        lam = 1.0
+
+    erp = damodaran_erp or 0.0446
+    print(f"  ERP: {erp:.2%} (Damodaran implied{'— live' if damodaran_erp else '— fallback'})")
 
     if ctx.benchmarks.industry_unlevered_beta:
         beta = relever_beta(ctx.benchmarks.industry_unlevered_beta, company_de, tax_rate)
