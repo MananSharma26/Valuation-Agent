@@ -212,45 +212,10 @@ def run(ticker: str, growth_override: float | None = None,
     ctx.financials.key_stats["company_news"] = company_news
     ctx.financials.key_stats["context_summary"] = context_summary
 
-    if company_profile.get("description"):
-        print(f"  Profile: {company_profile['description'][:150]}...")
-    if company_profile.get("revenue_growth"):
-        print(f"  Revenue Growth (YoY): {company_profile['revenue_growth']:.1%}")
-    if company_profile.get("earnings_growth"):
-        print(f"  Earnings Growth (YoY): {company_profile['earnings_growth']:.1%}")
-    if company_news:
-        print(f"  Recent news: {len(company_news)} articles")
-        for n in company_news[:3]:
-            print(f"    - {n['title'][:80]}")
-
-    # Earnings call transcript (from WRDS Capital IQ)
-    earnings_transcript = None
-    try:
-        from valuation.data.wrds_client import WRDSClient
-        w = WRDSClient()
-        # Try multiple name variants
-        for name_query in [data.name, ticker.split(".")[0]]:
-            if name_query:
-                earnings_transcript = w.fetch_earnings_transcript(name_query)
-                if earnings_transcript:
-                    break
-        w.close()
-    except Exception as e:
-        print(f"  Transcript error: {e}")
-
-    if earnings_transcript:
-        ctx.financials.key_stats["earnings_transcript"] = earnings_transcript
-        print(f"  Earnings call: {earnings_transcript['headline']}")
-        print(f"  Date: {earnings_transcript['date']}")
-        print(f"  Length: {len(earnings_transcript['transcript_text']):,} chars")
-    else:
-        print(f"  No earnings transcript available")
-
-    # SEC 10-K filings (US companies only)
-    sec_data = None
+    # SEC filings (US companies only)
     try:
         from valuation.data.sec_fetcher import fetch_sec_filings
-        sec_data = fetch_sec_filings(ticker, country=data.country or "")
+        sec_data = fetch_sec_filings(ticker.split(".")[0], country=data.country or "")
         if sec_data:
             ctx.financials.key_stats["sec_filings"] = sec_data
             print(f"  SEC 10-K: filed {sec_data.get('filing_date', 'N/A')}")
@@ -310,6 +275,40 @@ def run(ticker: str, growth_override: float | None = None,
             print(f"  Peer comparison: no SIC code available")
     except Exception as e:
         print(f"  Peer comparison error: {e}")
+
+    if company_profile.get("description"):
+        print(f"  Profile: {company_profile['description'][:150]}...")
+    if company_profile.get("revenue_growth"):
+        print(f"  Revenue Growth (YoY): {company_profile['revenue_growth']:.1%}")
+    if company_profile.get("earnings_growth"):
+        print(f"  Earnings Growth (YoY): {company_profile['earnings_growth']:.1%}")
+    if company_news:
+        print(f"  Recent news: {len(company_news)} articles")
+        for n in company_news[:3]:
+            print(f"    - {n['title'][:80]}")
+
+    # Earnings call transcript (from WRDS Capital IQ)
+    earnings_transcript = None
+    try:
+        from valuation.data.wrds_client import WRDSClient
+        w = WRDSClient()
+        # Try multiple name variants
+        for name_query in [data.name, ticker.split(".")[0]]:
+            if name_query:
+                earnings_transcript = w.fetch_earnings_transcript(name_query)
+                if earnings_transcript:
+                    break
+        w.close()
+    except Exception as e:
+        print(f"  Transcript error: {e}")
+
+    if earnings_transcript:
+        ctx.financials.key_stats["earnings_transcript"] = earnings_transcript
+        print(f"  Earnings call: {earnings_transcript['headline']}")
+        print(f"  Date: {earnings_transcript['date']}")
+        print(f"  Length: {len(earnings_transcript['transcript_text']):,} chars")
+    else:
+        print(f"  No earnings transcript available")
 
     # ================================================================
     # STEP 5: Risk Assessment
@@ -488,7 +487,7 @@ def run(ticker: str, growth_override: float | None = None,
         sourced_inputs["terminal_growth"] = computed(terminal_growth, "Nominal GDP proxy")
 
     # ================================================================
-    # STEP 6.5: Assumption Proposals (pointed recommendations)
+    # STEP 6.5: Assumption Proposals
     # ================================================================
     print(f"\n--- Step 6.5: Assumption Proposals ---")
     try:
