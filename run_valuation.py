@@ -369,14 +369,21 @@ def run(ticker: str, growth_override: float | None = None,
             pass
 
     # Priority: Live Treasury (US only) → Damodaran → hardcoded
-    # For non-US: local currency Rf = US Rf + CRP (Damodaran approach)
-    # This embeds country risk into Rf, so CRP is set to 0 separately
+    # Damodaran approach for ALL countries: Rf = US Treasury rate
+    # Country risk is added via CRP × Lambda, NOT embedded in Rf
+    # This allows terminal growth (5% for India) < Rf + CRP without violating the cap
     if is_india:
-        us_rf = damodaran_rf or 0.0418
-        rf = us_rf + (damodaran_crp or 0.032)  # ~7.4% = local currency Rf
-        crp = 0.0  # already embedded in local Rf
-        lam = 1.0  # irrelevant since CRP=0
-        print(f"  Rf: {rf:.2%} (India local currency: US Rf {us_rf:.2%} + CRP {damodaran_crp:.2%})")
+        rf = live_rf if (live_rf and 0.01 < live_rf < 0.10) else (damodaran_rf or 0.0418)
+        crp = damodaran_crp or 0.032  # India CRP from Damodaran ctryprem.xlsx
+        # Lambda: firm-specific country exposure
+        # 0.2 for IT exporters (TCS), 1.0 for domestic (HAL, Tata Steel)
+        sector = (ctx.company.sector or "").lower()
+        industry = (ctx.financials.key_stats.get("industry_yfinance") or "").lower()
+        if "technology" in sector or "software" in industry or "it " in industry:
+            lam = 0.3  # IT exporters — low India risk exposure
+        else:
+            lam = 1.0  # domestic companies — full India risk
+        print(f"  Rf: {rf:.2%} (US Treasury — Damodaran convention) | CRP: {crp:.2%} × Lambda: {lam}")
     elif is_japan:
         rf = 0.01  # Japan has its own yield curve
         crp = damodaran_crp or 0.0
