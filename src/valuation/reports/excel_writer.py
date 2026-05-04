@@ -198,6 +198,7 @@ def generate_excel(
         _write_assumptions(writer, ctx)
         _write_dcf_model(writer, ctx)
         _write_relative_valuation(writer, ctx)
+        _write_peer_comparison(writer, ctx)
         _write_sensitivity(writer, ctx)
         _write_analyst_consensus(writer, ctx, ibes_data)
         _write_data_sources(writer, ctx)
@@ -809,6 +810,105 @@ def _write_relative_valuation(writer: pd.ExcelWriter, ctx: ValuationContext) -> 
             vs_cell.number_format = _FMT_PCT
             _apply_upside_color(vs_cell)
             vs_cell.alignment = _RIGHT
+
+    _autofit_columns(ws)
+    _freeze_top_row(ws)
+
+
+def _write_peer_comparison(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
+    """Sheet: Peer comparison table with company vs peer median."""
+    peer_data = ctx.financials.key_stats.get("peer_comparison")
+    if not peer_data:
+        return
+
+    peers = peer_data.get("peers") or []
+    if not peers:
+        return
+
+    rows = [
+        ["PEER COMPARISON", "", "", "", "", "", ""],
+    ]
+
+    has_yahoo = any(p.get("ticker") for p in peers)
+
+    if has_yahoo:
+        rows.append(["Company", "Ticker", "P/E", "Profit Margin",
+                      "Revenue Growth", "Beta", "EV/EBITDA"])
+        for p in peers[:15]:
+            rows.append([
+                p.get("name", ""),
+                p.get("ticker", ""),
+                _safe(p.get("pe")),
+                _safe(p.get("profit_margin")),
+                _safe(p.get("revenue_growth")),
+                _safe(p.get("beta")),
+                _safe(p.get("ev_to_ebitda")),
+            ])
+    else:
+        rows.append(["Company", "Revenue", "Net Income", "Total Assets",
+                      "Country", "", ""])
+        for p in peers[:15]:
+            rows.append([
+                p.get("name", ""),
+                _safe(p.get("revenue")),
+                _safe(p.get("net_income")),
+                _safe(p.get("total_assets")),
+                p.get("country", ""),
+                "",
+                "",
+            ])
+
+    # Peer median
+    peer_median = peer_data.get("peer_median") or {}
+    if peer_median:
+        rows.append(["", "", "", "", "", "", ""])
+        rows.append(["PEER MEDIAN", "", "", "", "", "", ""])
+        for key, val in peer_median.items():
+            rows.append([key, _safe(val), "", "", "", "", ""])
+
+    # Company vs median
+    vs_median = peer_data.get("company_vs_median") or {}
+    if vs_median:
+        rows.append(["", "", "", "", "", "", ""])
+        rows.append(["COMPANY vs PEER MEDIAN", "Company", "Peer Median",
+                      "Difference", "Assessment", "", ""])
+        for key, comp in vs_median.items():
+            rows.append([
+                key,
+                _safe(comp.get("company")),
+                _safe(comp.get("peer_median")),
+                _safe(comp.get("diff_pct")),
+                comp.get("assessment", ""),
+                "",
+                "",
+            ])
+
+    n_cols = 7
+    for r in rows:
+        while len(r) < n_cols:
+            r.append("")
+
+    df = pd.DataFrame(rows, columns=[f"Col{i}" for i in range(n_cols)])
+    df.to_excel(writer, sheet_name="Peer Comparison", index=False)
+
+    ws = _ws(writer, "Peer Comparison")
+    _style_header_row(ws, 1, n_cols)
+
+    for row_idx in range(2, ws.max_row + 1):
+        label = ws.cell(row=row_idx, column=1).value or ""
+        if _is_section_title(label):
+            _style_section_title(ws, row_idx, n_cols)
+            continue
+
+        # Format numeric cells
+        for col_idx in range(2, n_cols + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if isinstance(cell.value, (int, float)):
+                if abs(cell.value) <= 1:
+                    cell.number_format = _FMT_PCT
+                else:
+                    cell.number_format = _FMT_DEC
+                cell.alignment = _RIGHT
 
     _autofit_columns(ws)
     _freeze_top_row(ws)

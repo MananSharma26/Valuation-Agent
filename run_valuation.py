@@ -246,6 +246,71 @@ def run(ticker: str, growth_override: float | None = None,
     else:
         print(f"  No earnings transcript available")
 
+    # SEC 10-K filings (US companies only)
+    sec_data = None
+    try:
+        from valuation.data.sec_fetcher import fetch_sec_filings
+        sec_data = fetch_sec_filings(ticker, country=data.country or "")
+        if sec_data:
+            ctx.financials.key_stats["sec_filings"] = sec_data
+            print(f"  SEC 10-K: filed {sec_data.get('filing_date', 'N/A')}")
+            if sec_data.get("risk_factors"):
+                print(f"  Risk Factors: {len(sec_data['risk_factors']):,} chars")
+            if sec_data.get("mda"):
+                print(f"  MD&A: {len(sec_data['mda']):,} chars")
+        else:
+            print(f"  SEC filings: N/A (non-US or not found)")
+    except Exception as e:
+        print(f"  SEC filings error: {e}")
+
+    # Macro context: Treasury yields, VIX, GDP forecast
+    try:
+        from valuation.data.news_fetcher import fetch_macro_context, fetch_gdp_forecast
+        macro = fetch_macro_context()
+        ctx.financials.key_stats["macro_context"] = macro
+        if macro.get("commentary"):
+            print(f"  Macro: {macro['commentary']}")
+
+        country_name = data.country or "United States"
+        gdp = fetch_gdp_forecast(country_name)
+        if gdp.get("gdp_growth") is not None:
+            macro["gdp_growth"] = gdp["gdp_growth"]
+            print(f"  GDP growth ({gdp['country_code']}): {gdp['gdp_growth']:.2%}")
+        ctx.financials.key_stats["macro_context"] = macro
+    except Exception as e:
+        print(f"  Macro context error: {e}")
+
+    # Peer comparison (WRDS + Yahoo)
+    try:
+        from valuation.data.peer_analysis import fetch_peer_comparison
+        sic = data.sic_code or ""
+        if sic:
+            profile_metrics = {
+                "pe": (company_profile.get("trailing_pe")
+                       if company_profile else None),
+                "profit_margin": (company_profile.get("profit_margins")
+                                  if company_profile else None),
+                "revenue_growth": (company_profile.get("revenue_growth")
+                                   if company_profile else None),
+                "beta": data.beta,
+            }
+            peer_comp = fetch_peer_comparison(
+                sic_code=sic,
+                company_name=data.name or "",
+                company_metrics=profile_metrics,
+                region=ctx.company.region,
+            )
+            if peer_comp:
+                ctx.financials.key_stats["peer_comparison"] = peer_comp
+                print(f"  Peers: {peer_comp.get('num_peers_wrds', 0)} from WRDS, "
+                      f"{peer_comp.get('num_peers_enriched', 0)} enriched via Yahoo")
+            else:
+                print(f"  Peer comparison: no peers found")
+        else:
+            print(f"  Peer comparison: no SIC code available")
+    except Exception as e:
+        print(f"  Peer comparison error: {e}")
+
     # ================================================================
     # STEP 5: Risk Assessment
     # ================================================================
@@ -421,6 +486,25 @@ def run(ticker: str, growth_override: float | None = None,
         sourced_inputs["terminal_growth"] = from_user(terminal_growth, f"CLI override: {terminal_override:.2%}")
     else:
         sourced_inputs["terminal_growth"] = computed(terminal_growth, "Nominal GDP proxy")
+
+    # ================================================================
+    # STEP 6.5: Assumption Proposals (pointed recommendations)
+    # ================================================================
+    print(f"\n--- Step 6.5: Assumption Proposals ---")
+    try:
+        from valuation.agents.assumption_proposer import propose_assumptions, format_proposals_for_report
+
+        proposals = propose_assumptions(ctx)
+        ctx.financials.key_stats["assumption_proposals"] = proposals
+        if proposals:
+            for p in proposals:
+                conf_label = "HIGH" if p.confidence >= 0.7 else "MED" if p.confidence >= 0.4 else "LOW"
+                print(f"  [{conf_label}] {p.parameter}: {p.question}")
+        else:
+            print(f"  No specific proposals generated")
+    except Exception as e:
+        print(f"  Proposal generation error: {e}")
+        proposals = []
 
     # ================================================================
     # STEP 7: Validate Before Engines

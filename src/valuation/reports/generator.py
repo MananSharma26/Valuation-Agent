@@ -62,6 +62,8 @@ def generate_report(ctx: ValuationContext) -> str:
         _section_company_profile(ctx),
         _section_company_context(ctx),
         _section_key_assumptions(ctx),
+        _section_peer_comparison(ctx),
+        _section_risk_factors(ctx),
         _section_dcf_valuation(ctx),
         _section_relative_valuation(ctx),
         _section_cross_validation(ctx),
@@ -300,6 +302,28 @@ def _section_company_context(ctx: ValuationContext) -> str:
             publisher = n.get("publisher", "")
             lines.append(f"- **{title}** ({publisher})")
 
+    # Macro context: Treasury yields, VIX, GDP
+    macro = ctx.financials.key_stats.get("macro_context") or {}
+    if macro.get("commentary"):
+        lines += ["", "### Macro Environment", ""]
+        macro_rows = []
+        if macro.get("treasury_10y") is not None:
+            macro_rows.append(("10Y Treasury Yield", _fmt_pct(macro["treasury_10y"])))
+        if macro.get("treasury_3m") is not None:
+            macro_rows.append(("3M T-Bill Rate", _fmt_pct(macro["treasury_3m"])))
+        if macro.get("treasury_5y") is not None:
+            macro_rows.append(("5Y Treasury Yield", _fmt_pct(macro["treasury_5y"])))
+        if macro.get("vix") is not None:
+            vix = macro["vix"]
+            vol_label = "low" if vix < 15 else "moderate" if vix < 25 else "high"
+            macro_rows.append(("VIX", f"{vix:.1f} ({vol_label})"))
+        if macro.get("sp500_pe") is not None:
+            macro_rows.append(("S&P 500 PE", f"{macro['sp500_pe']:.1f}"))
+        if macro.get("gdp_growth") is not None:
+            macro_rows.append(("GDP Growth Forecast", _fmt_pct(macro["gdp_growth"])))
+        if macro_rows:
+            lines.append(_md_table(["Indicator", "Value"], macro_rows))
+
     # Earnings call transcript excerpt
     transcript = ctx.financials.key_stats.get("earnings_transcript")
     if transcript:
@@ -368,6 +392,147 @@ def _section_key_assumptions(ctx: ValuationContext) -> str:
         if review_text:
             lines.append("")
             lines.append(review_text)
+
+    # Assumption proposals (pointed recommendations)
+    proposals = ctx.financials.key_stats.get("assumption_proposals") or []
+    if proposals:
+        try:
+            from valuation.agents.assumption_proposer import format_proposals_for_report
+            proposals_text = format_proposals_for_report(proposals)
+            if proposals_text:
+                lines.append("")
+                lines.append(proposals_text)
+        except ImportError:
+            pass
+
+    return "\n".join(lines)
+
+
+def _section_peer_comparison(ctx: ValuationContext) -> str:
+    """Peer comparison table + company vs peer median."""
+    peer_data = ctx.financials.key_stats.get("peer_comparison") if ctx.financials.key_stats else None
+    if not peer_data:
+        return ""
+
+    peers = peer_data.get("peers") or []
+    if not peers:
+        return ""
+
+    lines = ["## Peer Comparison"]
+
+    # Peer table
+    has_yahoo = any(p.get("ticker") for p in peers)
+    if has_yahoo:
+        lines += ["", "### Peer Companies", ""]
+        peer_rows = []
+        for p in peers[:10]:
+            peer_rows.append((
+                p.get("name", "N/A"),
+                p.get("ticker", "N/A"),
+                _fmt(p.get("pe"), decimals=1) if p.get("pe") else "N/A",
+                _fmt_pct(p.get("profit_margin")) if p.get("profit_margin") else "N/A",
+                _fmt_pct(p.get("revenue_growth")) if p.get("revenue_growth") else "N/A",
+                _fmt(p.get("beta"), decimals=2) if p.get("beta") else "N/A",
+            ))
+        lines.append(_md_table(
+            ["Company", "Ticker", "PE", "Profit Margin", "Revenue Growth", "Beta"],
+            peer_rows,
+        ))
+    else:
+        # WRDS-only peers
+        lines += ["", "### Peer Companies (WRDS/Compustat)", ""]
+        peer_rows = []
+        for p in peers[:10]:
+            rev = _fmt(p.get("revenue"), prefix="$") if p.get("revenue") else "N/A"
+            peer_rows.append((p.get("name", "N/A"), rev, p.get("country", "")))
+        lines.append(_md_table(["Company", "Revenue", "Country"], peer_rows))
+
+    # Company vs peer median
+    vs_median = peer_data.get("company_vs_median") or {}
+    if vs_median:
+        lines += ["", "### Company vs Peer Median", ""]
+        vs_rows = []
+        label_map = {
+            "pe": "P/E Ratio",
+            "forward_pe": "Forward P/E",
+            "profit_margin": "Profit Margin",
+            "revenue_growth": "Revenue Growth",
+            "beta": "Beta",
+            "ev_to_ebitda": "EV/EBITDA",
+            "earnings_growth": "Earnings Growth",
+        }
+        for key, comp in vs_median.items():
+            label = label_map.get(key, key)
+            co_val = comp.get("company")
+            med_val = comp.get("peer_median")
+            assessment = comp.get("assessment", "")
+
+            if "margin" in key or "growth" in key:
+                co_str = _fmt_pct(co_val) if co_val is not None else "N/A"
+                med_str = _fmt_pct(med_val) if med_val is not None else "N/A"
+            else:
+                co_str = _fmt(co_val, decimals=2) if co_val is not None else "N/A"
+                med_str = _fmt(med_val, decimals=2) if med_val is not None else "N/A"
+            vs_rows.append((label, co_str, med_str, assessment))
+
+        lines.append(_md_table(
+            ["Metric", "Company", "Peer Median", "Assessment"],
+            vs_rows,
+        ))
+
+    source = peer_data.get("source", "")
+    n_wrds = peer_data.get("num_peers_wrds", 0)
+    n_enriched = peer_data.get("num_peers_enriched", 0)
+    lines.append("")
+    lines.append(
+        f"_Source: {source} | {n_wrds} peers from WRDS, {n_enriched} enriched via Yahoo Finance_"
+    )
+
+    return "\n".join(lines)
+
+
+def _section_risk_factors(ctx: ValuationContext) -> str:
+    """SEC 10-K risk factors and MD&A excerpts."""
+    sec_data = ctx.financials.key_stats.get("sec_filings") if ctx.financials.key_stats else None
+    if not sec_data:
+        return ""
+
+    risk_factors = sec_data.get("risk_factors", "")
+    mda = sec_data.get("mda", "")
+    raw_context = sec_data.get("raw_context", "")
+
+    if not risk_factors and not mda and not raw_context:
+        return ""
+
+    lines = ["## SEC Filing Highlights"]
+
+    filing_date = sec_data.get("filing_date", "N/A")
+    filing_url = sec_data.get("filing_url", "")
+    lines += [
+        "",
+        f"_Source: SEC 10-K filed {filing_date}_",
+    ]
+    if filing_url:
+        lines.append(f"_Filing URL: {filing_url}_")
+
+    if risk_factors:
+        lines += ["", "### Risk Factors (Item 1A)", ""]
+        # Truncate for readability
+        excerpt = risk_factors[:3000]
+        if len(risk_factors) > 3000:
+            excerpt += "..."
+        lines.append(f"> {excerpt}")
+
+    if mda:
+        lines += ["", "### Management Discussion & Analysis (Item 7)", ""]
+        excerpt = mda[:3000]
+        if len(mda) > 3000:
+            excerpt += "..."
+        lines.append(f"> {excerpt}")
+
+    if not risk_factors and not mda and raw_context:
+        lines += ["", "### Filing Context", ""]
+        lines.append(f"> {raw_context[:2000]}...")
 
     return "\n".join(lines)
 
