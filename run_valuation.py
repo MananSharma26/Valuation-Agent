@@ -223,6 +223,29 @@ def run(ticker: str, growth_override: float | None = None,
         for n in company_news[:3]:
             print(f"    - {n['title'][:80]}")
 
+    # Earnings call transcript (from WRDS Capital IQ)
+    earnings_transcript = None
+    try:
+        from valuation.data.wrds_client import WRDSClient
+        w = WRDSClient()
+        # Try multiple name variants
+        for name_query in [data.name, ticker.split(".")[0]]:
+            if name_query:
+                earnings_transcript = w.fetch_earnings_transcript(name_query)
+                if earnings_transcript:
+                    break
+        w.close()
+    except Exception as e:
+        print(f"  Transcript error: {e}")
+
+    if earnings_transcript:
+        ctx.financials.key_stats["earnings_transcript"] = earnings_transcript
+        print(f"  Earnings call: {earnings_transcript['headline']}")
+        print(f"  Date: {earnings_transcript['date']}")
+        print(f"  Length: {len(earnings_transcript['transcript_text']):,} chars")
+    else:
+        print(f"  No earnings transcript available")
+
     # ================================================================
     # STEP 5: Risk Assessment
     # ================================================================

@@ -306,6 +306,15 @@ def _write_summary(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
         for n in news[:5]:
             rows.append([n.get("title", ""), n.get("publisher", "")])
 
+    transcript = ctx.financials.key_stats.get("earnings_transcript")
+    if transcript:
+        rows.append(["", ""])
+        rows.append(["LATEST EARNINGS CALL", ""])
+        rows.append([transcript.get("headline", ""), transcript.get("date", "")])
+        # Add key excerpts (first 500 chars)
+        excerpt = transcript.get("transcript_text", "")[:500]
+        rows.append([excerpt, ""])
+
     cols = ["Item", "Value", "vs Market"] if has_upside else ["Item", "Value"]
     # Pad rows to match column count
     ncols = len(cols)

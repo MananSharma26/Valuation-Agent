@@ -318,6 +318,61 @@ class WRDSClient:
 
         return pd.DataFrame(results)
 
+    def fetch_earnings_transcript(self, company_name: str, max_chars: int = 15000) -> dict | None:
+        """Fetch the most recent earnings call transcript from Capital IQ via WRDS.
+
+        Args:
+            company_name: Company name to search for (e.g., "NVIDIA", "Tata Consultancy")
+            max_chars: Max characters of transcript to return (truncate for LLM context window)
+
+        Returns dict with: headline, date, transcript_text, num_components
+        Returns None if not found.
+        """
+        db = self._connect()
+        try:
+            # Find most recent earnings call
+            result = db.raw_sql('''
+                SELECT transcriptid, companyname, headline, mostimportantdateutc
+                FROM ciq_transcripts.wrds_transcript_detail
+                WHERE UPPER(companyname) LIKE UPPER(%(name)s)
+                AND keydeveventtypename = %(type)s
+                ORDER BY mostimportantdateutc DESC
+                LIMIT 1
+            ''', params={'name': f'%{company_name}%', 'type': 'Earnings Calls'})
+
+            if result.empty:
+                return None
+
+            tid = int(result.iloc[0]['transcriptid'])
+
+            # Get transcript text
+            text_df = db.raw_sql('''
+                SELECT componentorder, componenttext
+                FROM ciq_transcripts.ciqtranscriptcomponent
+                WHERE transcriptid = %(tid)s
+                ORDER BY componentorder
+            ''', params={'tid': tid})
+
+            if text_df.empty:
+                return None
+
+            full_text = ' '.join(text_df['componenttext'].astype(str).tolist())
+
+            # Truncate for LLM context
+            if len(full_text) > max_chars:
+                full_text = full_text[:max_chars] + "\n\n[Transcript truncated...]"
+
+            return {
+                "headline": str(result.iloc[0]['headline']),
+                "date": str(result.iloc[0]['mostimportantdateutc']),
+                "company": str(result.iloc[0]['companyname']),
+                "transcript_text": full_text,
+                "num_components": len(text_df),
+            }
+        except Exception as e:
+            print(f"  Transcript fetch error: {e}")
+            return None
+
     def search_ibes_ticker(self, company_name: str, country_code: str = 'INR') -> pd.DataFrame:
         """Search for I/B/E/S ticker by company name.
 

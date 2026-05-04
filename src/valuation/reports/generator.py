@@ -300,6 +300,16 @@ def _section_company_context(ctx: ValuationContext) -> str:
             publisher = n.get("publisher", "")
             lines.append(f"- **{title}** ({publisher})")
 
+    # Earnings call transcript excerpt
+    transcript = ctx.financials.key_stats.get("earnings_transcript")
+    if transcript:
+        lines += ["", "### Latest Earnings Call", ""]
+        lines.append(f"**{transcript['headline']}** ({transcript['date']})")
+        lines.append("")
+        # Show first 2000 chars as excerpt
+        excerpt = transcript["transcript_text"][:2000]
+        lines.append(f"> {excerpt}...")
+
     return "\n".join(lines)
 
 
