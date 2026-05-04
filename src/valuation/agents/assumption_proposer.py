@@ -171,7 +171,7 @@ def _propose_wacc(ctx: ValuationContext) -> Proposal | None:
 
     # Check Rf against macro context (live Treasury yields)
     macro = ctx.financials.key_stats.get("macro_context") or {}
-    treasury_10y = macro.get("treasury_10y")
+    treasury_10y = macro.get("us_10yr_yield")
     if treasury_10y is not None and a.risk_free_rate is not None:
         rf_diff = abs(a.risk_free_rate - treasury_10y)
         if rf_diff > 0.005:

@@ -334,7 +334,23 @@ def run(ticker: str, growth_override: float | None = None,
 
     is_india = ctx.company.region == "India"
     is_japan = ctx.company.region == "Japan"
-    rf = 0.07 if is_india else (0.01 if is_japan else 0.0395)
+
+    # Use live Treasury yield from macro context if available, else hardcoded fallback
+    macro = ctx.financials.key_stats.get("macro_context") or {}
+    live_rf = macro.get("us_10yr_yield")
+
+    if is_india:
+        rf = 0.07  # India 10yr govt bond — no live source yet
+    elif is_japan:
+        rf = 0.01
+    elif live_rf and 0.01 < live_rf < 0.10:
+        rf = live_rf
+        print(f"  Using live US 10yr yield: {rf:.2%} (from Yahoo Finance ^TNX)")
+    else:
+        rf = 0.0395  # fallback
+        if live_rf:
+            print(f"  Live yield {live_rf:.2%} out of range, using fallback {rf:.2%}")
+
     erp = 0.0446
     crp = 0.0  # embedded in local Rf for India
     lam = 0.5 if is_india else 1.0
