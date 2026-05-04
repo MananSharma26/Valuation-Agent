@@ -375,14 +375,64 @@ def run(ticker: str, growth_override: float | None = None,
     if is_india:
         rf = live_rf if (live_rf and 0.01 < live_rf < 0.10) else (damodaran_rf or 0.0418)
         crp = damodaran_crp or 0.032  # India CRP from Damodaran ctryprem.xlsx
-        # Lambda: firm-specific country exposure
-        # 0.2 for IT exporters (TCS), 1.0 for domestic (HAL, Tata Steel)
-        sector = (ctx.company.sector or "").lower()
-        industry = (ctx.financials.key_stats.get("industry_yfinance") or "").lower()
-        if "technology" in sector or "software" in industry or "it " in industry:
-            lam = 0.3  # IT exporters — low India risk exposure
-        else:
-            lam = 1.0  # domestic companies — full India risk
+        # Lambda: firm-specific country risk exposure
+        # Damodaran's approach: Lambda ≈ domestic revenue / total revenue
+        # Primary: try WRDS Compustat geographic segments
+        # Fallback: sector-based heuristic (Damodaran examples as reference)
+        lam = None
+        try:
+            from valuation.data.wrds_client import WRDSClient
+            wc = WRDSClient()
+            dbc = wc._connect()
+            # Search for company in Compustat, get gvkey
+            search = wc.search_company(data.name.split()[0] if data.name else "", loc="IND")
+            if search is not None and len(search) > 0:
+                gvkey = search.iloc[0]["gvkey"]
+                geo = dbc.raw_sql('''
+                    SELECT f.revts, g.gareat
+                    FROM comp_segments_hist_daily.seg_annfund f
+                    JOIN comp_segments_hist_daily.wrds_seg_geo g
+                        ON f.gvkey = g.gvkey AND f.sid = g.sid
+                    WHERE f.gvkey = %(gvkey)s AND f.stype = %(stype)s
+                    AND f.revts IS NOT NULL AND f.revts > 0
+                    ORDER BY f.datadate DESC
+                    LIMIT 20
+                ''', params={'gvkey': gvkey, 'stype': 'GEOG'})
+                if len(geo) > 0:
+                    total_rev = geo["revts"].sum()
+                    india_rev = geo[geo["gareat"].str.contains("India|IND|Domestic", case=False, na=False)]["revts"].sum()
+                    if total_rev > 0:
+                        lam = round(india_rev / total_rev, 2)
+                        print(f"  Lambda: {lam} (from WRDS geo segments: {india_rev:.0f}/{total_rev:.0f} domestic)")
+            wc.close()
+        except Exception:
+            pass
+
+        # Fallback: sector-based heuristic per Damodaran examples
+        if lam is None:
+            sector = (ctx.company.sector or "").lower()
+            industry = (ctx.financials.key_stats.get("industry_yfinance") or "").lower()
+            if "technology" in sector or "software" in industry or "it " in industry or "information tech" in industry:
+                lam = 0.25  # IT exporters: Damodaran uses 0.2 for TCS
+            elif "pharmaceutical" in industry or "drug" in industry or "biotech" in industry:
+                lam = 0.5  # Pharma: significant exports
+            elif "auto" in industry and "part" not in industry:
+                lam = 0.8  # Auto: Damodaran uses 0.8 for Tata Motors (JLR global)
+            elif "chemical" in industry:
+                lam = 0.75  # Chemicals: Damodaran uses 0.75 for Tata Chemicals
+            elif "bank" in industry or "financial" in sector or "insurance" in industry:
+                lam = 1.0  # Financials: fully domestic
+            elif "defense" in industry or "aerospace" in industry:
+                lam = 1.0  # Defense: government customer, fully domestic
+            elif "steel" in industry or "mining" in industry or "metal" in industry:
+                lam = 1.1  # Commodities: Damodaran uses 1.1 for Tata Steel (more risky than avg)
+            elif "real estate" in industry or "construction" in industry:
+                lam = 1.0  # Fully domestic
+            elif "telecom" in industry or "utility" in industry:
+                lam = 1.0  # Domestic infrastructure
+            else:
+                lam = 0.8  # Default: mostly domestic
+            print(f"  Lambda: {lam} (sector heuristic: {sector}/{industry})")
         print(f"  Rf: {rf:.2%} (US Treasury — Damodaran convention) | CRP: {crp:.2%} × Lambda: {lam}")
     elif is_japan:
         rf = 0.01  # Japan has its own yield curve
