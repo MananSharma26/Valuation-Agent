@@ -311,6 +311,77 @@ class TestGoldenReinvestmentFormula:
         assert abs(result["yearly_reinvestment"][1] - 27.5) < 0.1
 
 
+class TestReinvestmentLag:
+    """Reinvestment lag: invest today for growth N years from now."""
+
+    _BASE_KWARGS = dict(
+        base_revenue=1000,
+        base_ebit=200,
+        revenue_growth_rates=[0.10] * 10,
+        operating_margins=[0.20] * 10,
+        tax_rates=[0.25] * 10,
+        waccs=[0.10] * 10,
+        sales_to_capital=2.0,
+        stable_growth=0.03,
+        stable_roc=0.15,
+        stable_wacc=0.10,
+        stable_tax_rate=0.25,
+        shares_outstanding=100,
+    )
+
+    def test_reinvestment_lag_different_patterns(self):
+        """Lag=0 and lag=2 should produce different reinvestment patterns."""
+        result_lag0 = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=0)
+        result_lag2 = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=2)
+        # Lag=2 invests today for growth two years ahead (larger future delta);
+        # with uniform 10% growth revenue deltas grow each year, so lag=2 shifts
+        # a larger delta into earlier years -> higher early reinvestment.
+        assert result_lag2["yearly_reinvestment"][0] > result_lag0["yearly_reinvestment"][0]
+
+    def test_revenue_unaffected_by_lag(self):
+        """Lag parameter must not alter the revenue projection."""
+        result_lag0 = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=0)
+        result_lag2 = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=2)
+        assert abs(result_lag0["yearly_revenue"][-1] - result_lag2["yearly_revenue"][-1]) < 0.01
+
+    def test_lag0_is_default_behavior(self):
+        """Explicit lag=0 must match the no-lag default (backward-compatibility)."""
+        result_default = fcff_valuation_v2(**self._BASE_KWARGS)
+        result_lag0 = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=0)
+        assert result_default["yearly_reinvestment"] == pytest.approx(
+            result_lag0["yearly_reinvestment"], rel=1e-9
+        )
+        assert result_default["enterprise_value"] == pytest.approx(
+            result_lag0["enterprise_value"], rel=1e-9
+        )
+
+    def test_lag0_reinvestment_formula(self):
+        """With lag=0, year-1 reinvestment = (rev1 - rev0) / S2C (existing formula)."""
+        result = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=0)
+        expected = (1000 * 1.10 - 1000) / 2.0   # (1100 - 1000) / 2.0 = 50
+        assert result["yearly_reinvestment"][0] == pytest.approx(expected, rel=1e-6)
+
+    def test_lag1_reinvestment_formula(self):
+        """With lag=1, year-1 reinvestment uses (rev2 - rev1) / S2C."""
+        result = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=1)
+        rev1 = 1000 * 1.10          # 1100
+        rev2 = 1000 * 1.10 ** 2    # 1210
+        expected = (rev2 - rev1) / 2.0  # 55.0
+        assert result["yearly_reinvestment"][0] == pytest.approx(expected, rel=1e-6)
+
+    def test_tail_years_use_terminal_reinvestment(self):
+        """Last `lag` years must fall back to terminal reinvestment rate * ebit_at."""
+        lag = 3
+        result = fcff_valuation_v2(**self._BASE_KWARGS, reinvestment_lag=lag)
+        terminal_reinv_rate = 0.03 / 0.15   # stable_growth / stable_roc = 0.20
+        n = len(self._BASE_KWARGS["revenue_growth_rates"])
+        # Last `lag` entries should equal terminal_reinv_rate * ebit_at
+        for t in range(n - lag, n):
+            expected = result["yearly_ebit_at"][t] * terminal_reinv_rate
+            assert result["yearly_reinvestment"][t] == pytest.approx(expected, rel=1e-6), \
+                f"tail year {t} reinvestment mismatch"
+
+
 class TestGoldenTerminalValue:
     """Terminal value uses g/ROC reinvestment rate applied to EBIT(1-t)_{n+1}."""
 

@@ -753,6 +753,23 @@ def run(ticker: str, growth_override: float | None = None,
         print(f"  All assumptions within expected ranges")
 
     # ================================================================
+    # STEP 7.9: Select Model Architecture
+    # ================================================================
+    from valuation.agents.model_router import select_model
+    model_selection = select_model(ctx)
+    print(f"\n--- Step 7.9: Model Selection ---")
+    print(f"  Primary: {model_selection.primary_model}")
+    if model_selection.secondary_models:
+        print(f"  Secondary: {', '.join(model_selection.secondary_models)}")
+    if model_selection.use_normalization:
+        print(f"  Cyclical normalization: ON")
+    if model_selection.use_failure_probability:
+        print(f"  Failure probability: ON")
+    if model_selection.reinvestment_lag:
+        print(f"  Reinvestment lag: {model_selection.reinvestment_lag} years")
+    print(f"  Reasoning: {model_selection.reasoning}")
+
+    # ================================================================
     # STEP 8: Run Valuation Engines
     # ================================================================
     print(f"\n--- Step 8: Valuation Engines ---")
@@ -763,7 +780,37 @@ def run(ticker: str, growth_override: float | None = None,
     capex = abs(float(cf.iloc[0].get('Capital Expenditure', 0) or 0)) if cf is not None and len(cf) > 0 else 0
     depr = float(cf.iloc[0].get('Depreciation And Amortization', 0) or 0) if cf is not None and len(cf) > 0 else 0
 
-    if ctx.company.classification == "financial":
+    # Stable-state assumptions (shared across non-financial models)
+    stable_beta = min(max(beta * 0.7, 0.8), 1.2)  # converges toward 1.0
+    stable_crp_adj = crp * 0.67 if crp > 0 else 0  # country risk reduces over time
+    stable_ke = compute_cost_of_equity(rf, stable_beta, erp, stable_crp_adj, lam)
+
+    # Stable D/E: company moves toward industry leverage
+    stable_de = (ctx.benchmarks.industry_de_ratio or 0.20) if company_de < 0.05 else company_de
+    stable_eq_w = 1 / (1 + stable_de)
+    stable_dbt_w = stable_de / (1 + stable_de)
+    stable_kd = cod  # same cost of debt
+    stable_tax = 0.25  # marginal
+    stable_wacc = compute_wacc(stable_ke, stable_kd, stable_tax, stable_eq_w, stable_dbt_w)
+
+    # Stable ROC: converges toward WACC (competitive advantages fade)
+    industry_roc = ctx.benchmarks.industry_margins.get("roic") if ctx.benchmarks.industry_margins else None
+    if industry_roc and industry_roc > stable_wacc:
+        stable_roc = min(industry_roc, stable_wacc * 2)  # cap at 2x WACC
+    else:
+        stable_roc = stable_wacc * 1.1  # slight excess returns persist
+
+    # Generate Damodaran-style schedules (used by multiple models)
+    wacc_sched = wacc_schedule(wacc, stable_wacc, n_years, n_constant=5)
+    tax_sched = tax_schedule(tax_rate, 0.25, n_years, n_constant=5)
+
+    # Operating margin convergence (from adjusted margin) — used by sensitivity analysis too
+    target_margin = min(adjusted_margin, 0.60)  # cap at 60% (Damodaran Nvidia convention)
+    if adjusted_margin < 0.15:
+        target_margin = max(adjusted_margin, ctx.benchmarks.industry_margins.get("operating_margin", 0.15) or 0.15)
+    margin_sched = margin_convergence_schedule(adjusted_margin, target_margin, convergence_year=5, n_years=n_years)
+
+    if model_selection.primary_model == "ddm":
         print(f"  [Financial routing] Using DDM + Excess Returns (not FCFF)")
         # DDM for financial firms
         eps = net_income / data.shares_outstanding if data.shares_outstanding > 0 else 0
@@ -796,42 +843,12 @@ def run(ticker: str, growth_override: float | None = None,
         )
         ctx.outputs.excess_returns = er_result
         print(f"  [Excess Returns] Value/Share: {er_result['value_per_share']:,.2f}")
-    else:
+
+    elif model_selection.primary_model == "fcff_revenue_s2c":
         # FCFF v2 — revenue-based with Damodaran transitions
         # (R&D and lease adjustments already applied in Step 5a/5b)
 
-        # Stable-state assumptions (Damodaran: risk/returns converge toward market average)
-        stable_beta = min(max(beta * 0.7, 0.8), 1.2)  # converges toward 1.0
-        stable_crp_adj = crp * 0.67 if crp > 0 else 0  # country risk reduces over time
-        stable_ke = compute_cost_of_equity(rf, stable_beta, erp, stable_crp_adj, lam)
-
-        # Stable D/E: company moves toward industry leverage
-        stable_de = (ctx.benchmarks.industry_de_ratio or 0.20) if company_de < 0.05 else company_de
-        stable_eq_w = 1 / (1 + stable_de)
-        stable_dbt_w = stable_de / (1 + stable_de)
-        stable_kd = cod  # same cost of debt
-        stable_tax = 0.25  # marginal
-        stable_wacc = compute_wacc(stable_ke, stable_kd, stable_tax, stable_eq_w, stable_dbt_w)
-
-        # Stable ROC: converges toward WACC (competitive advantages fade)
-        # Damodaran: Amazon uses 10%, Nvidia uses 20%, 3M stable ROC ~ WACC
-        industry_roc = ctx.benchmarks.industry_margins.get("roic") if ctx.benchmarks.industry_margins else None
-        if industry_roc and industry_roc > stable_wacc:
-            stable_roc = min(industry_roc, stable_wacc * 2)  # cap at 2x WACC
-        else:
-            stable_roc = stable_wacc * 1.1  # slight excess returns persist
-
         print(f"  Stable: WACC={stable_wacc:.2%}, ROC={stable_roc:.2%}, Beta={stable_beta:.2f}, CRP={stable_crp_adj:.2%}")
-
-        # Generate Damodaran-style schedules
-        wacc_sched = wacc_schedule(wacc, stable_wacc, n_years, n_constant=5)
-        tax_sched = tax_schedule(tax_rate, 0.25, n_years, n_constant=5)
-
-        # Operating margin convergence (from adjusted margin)
-        target_margin = min(adjusted_margin, 0.60)  # cap at 60% (Damodaran Nvidia convention)
-        if adjusted_margin < 0.15:
-            target_margin = max(adjusted_margin, ctx.benchmarks.industry_margins.get("operating_margin", 0.15) or 0.15)
-        margin_sched = margin_convergence_schedule(adjusted_margin, target_margin, convergence_year=5, n_years=n_years)
 
         sourced_inputs["sales_to_capital"] = computed(s2c, "Revenue / Adjusted Invested Capital")
         print(f"  [Schedules] WACC: {wacc:.2%} -> {stable_wacc:.2%} | Tax: {tax_rate:.1%} -> 25%")
@@ -858,26 +875,140 @@ def run(ticker: str, growth_override: float | None = None,
             rd_adjustment=0,  # already applied to base_ebit
             research_asset=research_asset,
             base_invested_capital=adjusted_invested_capital,
+            reinvestment_lag=model_selection.reinvestment_lag,
         )
         ctx.outputs.dcf_fcff = fcff_result
         print(f"  [FCFF DCF v2] Value/Share: {fcff_result['equity_value_per_share']:,.2f}")
         print(f"    EV: {fcff_result['enterprise_value']:,.0f} | PV HG: {fcff_result['pv_high_growth']:,.0f} | PV TV: {fcff_result['pv_terminal']:,.0f}")
+        if model_selection.reinvestment_lag:
+            print(f"    Reinvestment lag: {model_selection.reinvestment_lag} years")
 
-        # Also run Gordon Growth for stable dividend-paying companies
-        if (ctx.company.classification == "mature"
-                and data.dividend_per_share and data.dividend_per_share > 0
-                and ctx.assumptions.cost_of_equity and ctx.assumptions.terminal_growth):
+    elif model_selection.primary_model == "fcff_traditional":
+        # Traditional earnings-driven FCFF using fcff_valuation (v1)
+        print(f"  Stable: WACC={stable_wacc:.2%}, ROC={stable_roc:.2%}, Beta={stable_beta:.2f}, CRP={stable_crp_adj:.2%}")
+
+        # If cyclical, normalize earnings first
+        base_ebit_at = adjusted_ebit * (1 - tax_rate)
+        if model_selection.use_normalization:
+            from valuation.engines.normalization import normalize_earnings_cyclical
             try:
-                gg_value = gordon_growth_value(
-                    current_dividend=data.dividend_per_share,
-                    cost_of_equity=ctx.assumptions.cost_of_equity,
-                    growth_rate=ctx.assumptions.terminal_growth,
-                )
-                if not ctx.outputs.dcf_fcfe:
-                    ctx.outputs.dcf_fcfe = {"value_per_share": gg_value, "model": "gordon_growth"}
-                print(f"  [Gordon Growth] Value/Share: {gg_value:,.2f}")
-            except (ValueError, ZeroDivisionError):
-                pass
+                norm = normalize_earnings_cyclical(inc)
+                if norm and norm.get("normalized_ebit"):
+                    base_ebit_at = norm["normalized_ebit"] * (1 - tax_rate)
+                    print(f"  [Normalized] EBIT: {norm['normalized_ebit']:,.0f} (was {adjusted_ebit:,.0f}), cycle: {norm['cycle_position']}")
+            except (ValueError, KeyError) as e:
+                print(f"  [Normalization skipped] {e}")
+
+        # Traditional reinvestment rate from actual capex
+        # Include working capital change
+        wc_change = 0
+        if cf is not None and len(cf) > 0:
+            for col in cf.columns:
+                if 'working capital' in col.lower():
+                    wc_change = float(cf.iloc[0].get(col, 0) or 0)
+                    break
+        actual_reinv_rate = (capex - depr + abs(wc_change)) / base_ebit_at if base_ebit_at > 0 else 0.30
+        actual_reinv_rate = max(min(actual_reinv_rate, 0.80), 0.0)  # bound 0-80%
+
+        # Growth from fundamentals: reinvestment_rate x ROC
+        roc = base_ebit_at / adjusted_invested_capital if adjusted_invested_capital > 0 else 0.10
+        fundamental_g = actual_reinv_rate * roc
+
+        # Use growth override if provided, else fundamental
+        if growth_override is not None:
+            hg = growth_override
+        else:
+            hg = min(fundamental_g, 0.15)  # mature companies rarely grow > 15%
+
+        stable_reinv = terminal_growth / stable_roc if stable_roc > 0 else 0.30
+        reinv_rates = interpolate_params(actual_reinv_rate, stable_reinv, n_years, gradual=True)
+
+        fcff_result = fcff_valuation(
+            current_ebit_after_tax=base_ebit_at,
+            growth_rates=growth_rates,  # already computed
+            reinvestment_rates=reinv_rates,
+            waccs=wacc_sched,
+            stable_growth=terminal_growth,
+            stable_roc=stable_roc,
+            stable_wacc=stable_wacc,
+            cash=cash, debt=adjusted_total_debt,
+            shares_outstanding=data.shares_outstanding,
+        )
+        ctx.outputs.dcf_fcff = fcff_result
+        print(f"  [Traditional FCFF] Value/Share: {fcff_result['equity_value_per_share']:,.2f}")
+        print(f"    Reinvestment rate: {actual_reinv_rate:.1%} | ROC: {roc:.1%} | Fundamental g: {fundamental_g:.1%}")
+
+        # Apply failure probability if distressed
+        if model_selection.use_failure_probability:
+            from valuation.engines.distress import failure_adjusted_valuation, get_failure_probability
+            rating_for_distress, _ = get_synthetic_rating(icr, "large")
+            try:
+                p_fail = get_failure_probability(rating_for_distress)
+                book_assets = float(latest_bs.get('Total Assets', 0) or 0)
+                distress_proceeds = book_assets * 0.50 / data.shares_outstanding  # per share
+                adj = failure_adjusted_valuation(fcff_result["equity_value_per_share"], p_fail, distress_proceeds)
+                fcff_result["equity_value_per_share"] = adj["adjusted_value"]
+                fcff_result["failure_adjustment"] = adj
+                ctx.outputs.dcf_fcff = fcff_result
+                print(f"  [Distress adjusted] P(fail)={p_fail:.1%}, Adjusted: {adj['adjusted_value']:,.2f}")
+            except KeyError as e:
+                print(f"  [Distress adjustment skipped] {e}")
+
+    elif model_selection.primary_model == "gordon_growth":
+        from valuation.engines.dcf import gordon_growth_value as gg_fn
+        gg_value = gg_fn(
+            current_dividend=data.dividend_per_share,
+            cost_of_equity=ke,
+            growth_rate=terminal_growth,
+        )
+        ctx.outputs.dcf_fcfe = {"value_per_share": gg_value, "model": "gordon_growth"}
+        print(f"  [Gordon Growth] Value/Share: {gg_value:,.2f}")
+
+        # Also run traditional FCFF as secondary
+        if "fcff_traditional" in model_selection.secondary_models:
+            base_ebit_at = adjusted_ebit * (1 - tax_rate)
+            wc_change = 0
+            if cf is not None and len(cf) > 0:
+                for col in cf.columns:
+                    if 'working capital' in col.lower():
+                        wc_change = float(cf.iloc[0].get(col, 0) or 0)
+                        break
+            actual_reinv_rate = (capex - depr + abs(wc_change)) / base_ebit_at if base_ebit_at > 0 else 0.30
+            actual_reinv_rate = max(min(actual_reinv_rate, 0.80), 0.0)
+            stable_reinv = terminal_growth / stable_roc if stable_roc > 0 else 0.30
+            reinv_rates = interpolate_params(actual_reinv_rate, stable_reinv, n_years, gradual=True)
+
+            fcff_result = fcff_valuation(
+                current_ebit_after_tax=base_ebit_at,
+                growth_rates=growth_rates,
+                reinvestment_rates=reinv_rates,
+                waccs=wacc_sched,
+                stable_growth=terminal_growth,
+                stable_roc=stable_roc,
+                stable_wacc=stable_wacc,
+                cash=cash, debt=adjusted_total_debt,
+                shares_outstanding=data.shares_outstanding,
+            )
+            ctx.outputs.dcf_fcff = fcff_result
+            print(f"  [Traditional FCFF secondary] Value/Share: {fcff_result['equity_value_per_share']:,.2f}")
+
+    # Also run Gordon Growth for stable dividend-paying companies (if not already primary)
+    if (model_selection.primary_model != "gordon_growth"
+            and model_selection.primary_model != "ddm"
+            and ctx.company.classification == "mature"
+            and data.dividend_per_share and data.dividend_per_share > 0
+            and ctx.assumptions.cost_of_equity and ctx.assumptions.terminal_growth):
+        try:
+            gg_value = gordon_growth_value(
+                current_dividend=data.dividend_per_share,
+                cost_of_equity=ctx.assumptions.cost_of_equity,
+                growth_rate=ctx.assumptions.terminal_growth,
+            )
+            if not ctx.outputs.dcf_fcfe:
+                ctx.outputs.dcf_fcfe = {"value_per_share": gg_value, "model": "gordon_growth"}
+            print(f"  [Gordon Growth] Value/Share: {gg_value:,.2f}")
+        except (ValueError, ZeroDivisionError):
+            pass
 
     # Store sourced inputs in context for report transparency
     ctx.financials.key_stats["sourced_inputs"] = sourced_inputs
@@ -1064,6 +1195,32 @@ def run(ticker: str, growth_override: float | None = None,
         for line in divergence_explanation.splitlines():
             print(f"  {line}")
     ctx.financials.key_stats["divergence_explanation"] = divergence_explanation
+
+    # Run reverse DCF to explain the gap
+    if ctx.outputs.dcf_fcff and data.price > 0:
+        try:
+            from valuation.engines.reverse_dcf import implied_growth_rate, implied_wacc, reverse_dcf_summary
+            our_value = ctx.outputs.dcf_fcff.get("equity_value_per_share", 0)
+            if our_value > 0 and abs(our_value - data.price) / data.price > 0.15:
+                ig = implied_growth_rate(
+                    market_price=data.price, base_revenue=revenue, base_ebit=adjusted_ebit,
+                    operating_margin=adjusted_margin, tax_rate=tax_rate,
+                    wacc=wacc, stable_wacc=stable_wacc, sales_to_capital=s2c,
+                    stable_growth=terminal_growth, stable_roc=stable_roc,
+                    cash=cash, debt=adjusted_total_debt, shares_outstanding=data.shares_outstanding,
+                )
+                iw = implied_wacc(
+                    market_price=data.price, base_revenue=revenue, base_ebit=adjusted_ebit,
+                    revenue_growth_rates=growth_rates, operating_margin=adjusted_margin,
+                    tax_rate=tax_rate, sales_to_capital=s2c,
+                    stable_growth=terminal_growth, stable_roc=stable_roc,
+                    cash=cash, debt=adjusted_total_debt, shares_outstanding=data.shares_outstanding,
+                )
+                summary = reverse_dcf_summary(data.price, our_value, growth_rates[0], wacc, ig, iw)
+                print(f"\n  {summary}")
+                ctx.financials.key_stats["reverse_dcf"] = {"implied_growth": ig, "implied_wacc": iw}
+        except Exception as e:
+            print(f"  Reverse DCF error: {e}")
 
     # ================================================================
     # STEP 12: Confidence Scoring

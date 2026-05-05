@@ -523,6 +523,7 @@ def fcff_valuation_v2(
     rd_adjustment: float = 0.0,
     research_asset: float = 0.0,
     base_invested_capital: float = 0.0,
+    reinvestment_lag: int = 0,
 ) -> dict:
     """Revenue-based FCFF DCF with Damodaran-style transitions.
 
@@ -533,6 +534,7 @@ def fcff_valuation_v2(
     - Per-year WACC and tax rate (supports transitions)
     - R&D adjustment to base EBIT and invested capital
     - Tracks invested capital and ROIC
+    - Optional reinvestment lag (invest today for growth N years ahead)
 
     Parameters
     ----------
@@ -576,6 +578,13 @@ def fcff_valuation_v2(
         Total unamortized R&D asset (added to invested capital).
     base_invested_capital : float
         Book equity + book debt - cash (before R&D adjustment).
+    reinvestment_lag : int
+        Number of years ahead that today's reinvestment funds.
+        - lag=0 (default): reinvestment_t based on (rev_t - rev_{t-1}), current behavior.
+        - lag=1: reinvestment_t based on (rev_{t+1} - rev_t), invest now for next year's growth.
+        - lag=k: reinvestment_t based on (rev_{t+k} - rev_{t+k-1}).
+        For the last ``lag`` years where future revenue is unavailable, the terminal
+        reinvestment rate (stable_growth / stable_roc) is applied to that year's EBIT(1-t).
 
     Returns
     -------
@@ -597,8 +606,16 @@ def fcff_valuation_v2(
     if invested_capital <= 0:
         invested_capital = base_revenue / sales_to_capital if sales_to_capital > 0 else base_revenue
 
+    # Pre-compute full revenue schedule (indices 0..n, where index 0 = base_revenue)
+    # revenues[t] is revenue at end of year t; revenues[0] = base_revenue (year 0).
+    revenues: List[float] = [base_revenue]
+    rev = base_revenue
+    for g in revenue_growth_rates:
+        rev = rev * (1.0 + g)
+        revenues.append(rev)
+    # revenues has length n+1: revenues[0]=base, revenues[1]=year1, ..., revenues[n]=year n
+
     # Project year by year
-    revenue = base_revenue
     yearly_revenue: List[float] = []
     yearly_ebit: List[float] = []
     yearly_ebit_at: List[float] = []
@@ -607,12 +624,24 @@ def fcff_valuation_v2(
     yearly_ic: List[float] = []
     yearly_roic: List[float] = []
 
+    # Terminal reinvestment rate, used when lag pushes beyond projection window
+    terminal_reinvestment_rate = stable_growth / stable_roc if stable_roc > 0 else 0.0
+
     for t in range(n):
-        prev_revenue = revenue
-        revenue = revenue * (1 + revenue_growth_rates[t])
+        revenue = revenues[t + 1]  # end-of-year t revenue
         ebit = revenue * operating_margins[t]
         ebit_at = ebit * (1 - tax_rates[t])
-        reinvestment = reinvestment_s2c(prev_revenue, revenue, sales_to_capital)
+
+        lag_future_idx = t + 1 + reinvestment_lag   # index into revenues[] for the lagged delta
+        lag_prev_idx   = t + reinvestment_lag        # index for the prior year in the lagged delta
+
+        if lag_future_idx <= n:
+            # Lagged revenue delta is within the projection window
+            reinvestment = reinvestment_s2c(revenues[lag_prev_idx], revenues[lag_future_idx], sales_to_capital)
+        else:
+            # Beyond projection window: use terminal reinvestment rate applied to this year's EBIT(1-t)
+            reinvestment = ebit_at * terminal_reinvestment_rate
+
         fcff = ebit_at - reinvestment
 
         roic = ebit_at / invested_capital if invested_capital > 0 else 0
