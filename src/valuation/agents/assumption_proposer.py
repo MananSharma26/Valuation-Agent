@@ -402,11 +402,17 @@ def format_proposals_for_report(proposals: list[Proposal]) -> str:
     lines = ["### Assumption Proposals", ""]
 
     for p in proposals:
-        conf_label = (
-            "HIGH" if p.confidence >= 0.7
-            else "MEDIUM" if p.confidence >= 0.4
-            else "LOW"
-        )
+        # confidence can be float (0-1) or string ("high"/"medium"/"low")
+        if isinstance(p.confidence, str):
+            conf_label = p.confidence.upper()
+        elif isinstance(p.confidence, (int, float)):
+            conf_label = (
+                "HIGH" if p.confidence >= 0.7
+                else "MEDIUM" if p.confidence >= 0.4
+                else "LOW"
+            )
+        else:
+            conf_label = "MEDIUM"
         lines.append(f"**{p.parameter}** (confidence: {conf_label})")
         lines.append(f"- Current: {_fmt_val(p.current_value)}")
         if p.proposed_value != p.current_value:
