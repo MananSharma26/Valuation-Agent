@@ -971,6 +971,46 @@ def run(ticker: str, growth_override: float | None = None,
             except KeyError as e:
                 print(f"  [Distress adjustment skipped] {e}")
 
+    elif model_selection.primary_model == "fcfe":
+        # FCFE model for non-bank financials or low-payout companies
+        from valuation.engines.fcfe import fcfe_valuation as fcfe_fn
+        ni = float(latest_inc.get('Net Income', 0) or 0)
+        capex = abs(float(cf.iloc[0].get('Capital Expenditure', 0) or 0)) if cf is not None and len(cf) > 0 else 0
+        depr = float(cf.iloc[0].get('Depreciation And Amortization', 0) or 0) if cf is not None and len(cf) > 0 else 0
+        wc_change = 0
+        if cf is not None and len(cf) > 0:
+            for col in cf.columns:
+                if 'working capital' in col.lower():
+                    wc_change = abs(float(cf.iloc[0].get(col, 0) or 0))
+                    break
+        capex_to_depr = capex / depr if depr > 0 else 1.2
+        wc_to_rev = wc_change / revenue if revenue > 0 else 0.05
+        debt_ratio = adjusted_total_debt / (market_cap + adjusted_total_debt) if (market_cap + adjusted_total_debt) > 0 else 0
+
+        ke_rates = wacc_sched  # for FCFE, discount at cost of equity (WACC ≈ Ke for low-debt)
+        stable_roe_fcfe = min(roe, 0.20) if roe > 0 else 0.12
+
+        fcfe_result = fcfe_fn(
+            current_net_income=ni,
+            growth_rates=growth_rates,
+            capex_to_depreciation=capex_to_depr,
+            wc_to_revenue_change=wc_to_rev,
+            debt_ratio=debt_ratio,
+            cost_of_equities=ke_rates,
+            stable_growth=terminal_growth,
+            stable_roe=stable_roe_fcfe,
+            stable_ke=stable_wacc,
+            current_depreciation=depr,
+            current_revenue=revenue,
+            revenue_growth_rates=growth_rates,
+            cash=cash,
+            debt=adjusted_total_debt,
+            shares_outstanding=data.shares_outstanding,
+        )
+        ctx.outputs.dcf_fcfe = fcfe_result
+        print(f"  [FCFE] Value/Share: {fcfe_result['value_per_share']:,.2f}")
+        print(f"    CapEx/Depr: {capex_to_depr:.2f} | WC/Rev: {wc_to_rev:.1%} | Debt ratio: {debt_ratio:.1%}")
+
     elif model_selection.primary_model == "gordon_growth":
         from valuation.engines.dcf import gordon_growth_value as gg_fn
         gg_value = gg_fn(

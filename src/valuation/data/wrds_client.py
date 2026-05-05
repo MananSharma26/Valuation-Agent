@@ -20,11 +20,14 @@ class WRDSClient:
 
             # Read password from .pgpass so WRDS doesn't prompt interactively
             pgpass = pathlib.Path.home() / ".pgpass"
-            if pgpass.exists() and "PGPASSWORD" not in os.environ:
+            if pgpass.exists():
                 for line in pgpass.read_text().strip().splitlines():
                     parts = line.split(":")
                     if len(parts) >= 5 and "wrds" in parts[0]:
-                        os.environ["PGPASSWORD"] = parts[4]
+                        if "PGPASSWORD" not in os.environ:
+                            os.environ["PGPASSWORD"] = parts[4]
+                        if "PGUSER" not in os.environ:
+                            os.environ["PGUSER"] = parts[3]
                         break
 
             import wrds

@@ -809,7 +809,10 @@ def _write_assumptions(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
         row += 1
         for param, info in a.overrides.items():
             ws.cell(row=row, column=1, value=param).font = _NORMAL_FONT
-            ws.cell(row=row, column=2, value=info.get("new")).alignment = _RIGHT
+            new_val = info.get("new")
+            if isinstance(new_val, (list, dict)):
+                new_val = str(new_val)[:100]  # truncate complex values for Excel
+            ws.cell(row=row, column=2, value=new_val).alignment = _RIGHT
             ws.cell(row=row, column=3, value=info.get("reason", "")).font = _NORMAL_FONT
             row += 1
         row += 1
@@ -898,13 +901,31 @@ def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 
     elif ctx.outputs.dcf_fcfe:
         d = ctx.outputs.dcf_fcfe
-        n = len(d.get("yearly_eps", []))
-        rows = {
-            "Year": list(range(1, n + 1)),
-            "EPS": d.get("yearly_eps", []),
-            "DPS": d.get("yearly_dps", []),
-            "PV of DPS": d.get("yearly_pv", []),
-        }
+        model_type = d.get("model", "ddm")
+
+        if model_type == "fcfe":
+            # FCFE model output
+            n = len(d.get("yearly_ni", []))
+            rows = {
+                "Year": list(range(1, n + 1)),
+                "Net Income": d.get("yearly_ni", []),
+                "FCFE": d.get("yearly_fcfe", []),
+                "PV of FCFE": d.get("yearly_pv", []),
+            }
+        else:
+            # DDM or Gordon Growth output
+            n = len(d.get("yearly_eps", d.get("yearly_ni", [])))
+            rows = {
+                "Year": list(range(1, n + 1)),
+                "EPS": d.get("yearly_eps", []),
+                "DPS": d.get("yearly_dps", []),
+                "PV of DPS": d.get("yearly_pv", []),
+            }
+
+        # Filter out empty lists to prevent length mismatch
+        rows = {k: v for k, v in rows.items() if v}
+        if not rows or not rows.get("Year"):
+            return
         df = pd.DataFrame(rows)
         summary = pd.DataFrame([
             {"Year": "", "EPS": "", "DPS": "", "PV of DPS": ""},
