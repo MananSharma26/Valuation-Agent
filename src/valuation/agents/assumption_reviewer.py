@@ -265,23 +265,26 @@ def review_assumptions(ctx: ValuationContext) -> list[dict]:
             "severity": "info",
         })
 
-    # 10. Locked-in revenue / order book — check if WACC is appropriate
+    # 10. Locked-in revenue / order book — supports higher growth confidence
     transcript = ctx.financials.key_stats.get("earnings_transcript")
-    if transcript and a.wacc and a.wacc > 0.12:
+    if transcript and a.growth_rates:
         text = transcript.get("transcript_text", "").lower()
         order_keywords = ["order book", "order backlog", "locked in", "visibility", "pipeline"]
         if any(kw in text for kw in order_keywords):
+            current_g = a.growth_rates[0] if a.growth_rates else 0
             reviews.append({
-                "field": "revenue_visibility",
-                "value": a.wacc,
+                "field": "growth_confidence",
+                "value": current_g,
                 "benchmark": None,
-                "flag": "high",
+                "flag": "info",
                 "comment": (
                     f"Earnings call mentions order book/backlog/visibility. "
-                    f"High revenue visibility reduces risk — current WACC ({a.wacc:.2%}) may be too high. "
-                    f"Companies with locked-in revenue often warrant lower discount rates."
+                    f"Locked-in revenue supports higher growth confidence — "
+                    f"current growth assumption ({current_g:.1%}) may be conservative. "
+                    f"Note: order visibility increases growth certainty, not WACC. "
+                    f"WACC reflects systematic market risk, not order book status."
                 ),
-                "severity": "warning",
+                "severity": "info",
             })
 
     # 11. Implied ROC check — growth destroys value if ROC < WACC
