@@ -1368,7 +1368,8 @@ def run(ticker: str, growth_override: float | None = None,
         upside = (val - data.price) / data.price * 100 if data.price > 0 else 0
         print(f"  {model_name:25s}  {val:>12,.2f}  ({upside:+.1f}%)")
 
-    print(f"\n  Market Price:               {data.price:>12,.2f}")
+    print(f"\n  {'─'*50}")
+    print(f"  Market Price:               {data.price:>12,.2f}")
     values = list(all_values.values())
     if values:
         mean_val = sum(values) / len(values)
@@ -1376,6 +1377,33 @@ def run(ticker: str, growth_override: float | None = None,
         print(f"  Mean Intrinsic:             {mean_val:>12,.2f}  ({upside:+.1f}%)")
         print(f"  Range:                      {min(values):>12,.2f} — {max(values):,.2f}")
 
+    # Analyst consensus (for comparison)
+    analyst = ctx.financials.key_stats.get("analyst_data") or {}
+    pt = analyst.get("price_targets") or {}
+    recs = analyst.get("recommendations") or []
+    ee = analyst.get("earnings_estimate") or {}
+    if pt.get("targetMean") or recs:
+        print(f"\n  {'─'*50}")
+        print(f"  ANALYST CONSENSUS (comparison only)")
+    if pt.get("targetMean"):
+        at_upside = (pt["targetMean"] - data.price) / data.price * 100 if data.price > 0 else 0
+        print(f"  Analyst Mean Target:        {pt['targetMean']:>12,.2f}  ({at_upside:+.1f}%)")
+    if pt.get("targetHigh"):
+        print(f"  Analyst High:               {pt['targetHigh']:>12,.2f}")
+    if pt.get("targetLow"):
+        print(f"  Analyst Low:                {pt['targetLow']:>12,.2f}")
+    if recs:
+        r = recs[0]
+        buys = r.get("strongBuy", 0) + r.get("buy", 0)
+        holds = r.get("hold", 0)
+        sells = r.get("sell", 0) + r.get("strongSell", 0)
+        total = buys + holds + sells
+        buy_pct = buys / total * 100 if total > 0 else 0
+        print(f"  Buy/Hold/Sell:              {buys}/{holds}/{sells} ({buy_pct:.0f}% Buy)")
+    if ee.get("growth", {}).get("+1y"):
+        print(f"  Consensus EPS Growth (NY):  {ee['growth']['+1y']:.1%}")
+
+    print(f"\n  {'─'*50}")
     if ctx.confidence.composite:
         print(f"  Confidence:                 {ctx.confidence.composite:.0%}")
 
