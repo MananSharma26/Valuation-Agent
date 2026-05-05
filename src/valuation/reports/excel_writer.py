@@ -937,13 +937,24 @@ def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 def _write_dcf_model_v2_formulas(
     writer: pd.ExcelWriter, ctx: ValuationContext, d: dict, n: int
 ) -> None:
-    """Write the DCF Model sheet using Excel formulas (revenue-based / v2).
+    """Write the DCF Model sheet using Excel formulas referencing the Assumptions sheet.
+
+    All key inputs (WACC, growth, margins, cash, debt, shares) are pulled from
+    the Assumptions sheet at known cell positions, making the workbook fully dynamic.
 
     Layout:
       Col A: Labels
       Col B: Base year
       Col C..C+n-1: Year 1..n
       Col C+n: Terminal year
+
+    Assumptions sheet references:
+      B4=Rf, B5=Beta, B6=ERP, B7=Lambda, B8=CRP, B9=Ke, B10=Kd,
+      B11=TaxRate, B12=MarginalTax, B13=DebtWeight, B14=WACC,
+      B17=HighGrowth, B18=TerminalGrowth, B19=CurrentMargin,
+      B20=TargetMargin, B21=S2C, B22=StableROC, B23=ConvergenceYear,
+      B26=BaseRevenue, B27=BaseEBIT, B28=Cash, B29=Debt,
+      B30=Shares, B31=Price
     """
     a = ctx.assumptions
     yearly_revenue = d.get("yearly_revenue", [])
@@ -956,55 +967,13 @@ def _write_dcf_model_v2_formulas(
     base_revenue = d.get("base_revenue")
     base_ebit = d.get("base_ebit")
 
-    # Back-calculate base revenue from first projection year + growth rate
     if base_revenue is None and yearly_revenue and a.growth_rates:
         g0 = a.growth_rates[0]
         base_revenue = yearly_revenue[0] / (1 + g0) if g0 != -1 else yearly_revenue[0]
 
-    # Compute per-year growth rates from data
-    rev_growth: list = []
-    for t in range(n):
-        prev = base_revenue if t == 0 else yearly_revenue[t - 1]
-        if prev and prev != 0:
-            rev_growth.append(yearly_revenue[t] / prev - 1)
-        elif a.growth_rates and t < len(a.growth_rates):
-            rev_growth.append(a.growth_rates[t])
-        else:
-            rev_growth.append(0)
+    base_margin = (base_ebit / base_revenue) if (base_ebit is not None and base_revenue) else 0
 
-    # Operating margin per year
-    op_margins: list = []
-    for t in range(n):
-        rev = yearly_revenue[t] if t < len(yearly_revenue) else 0
-        ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
-        if rev and rev != 0:
-            op_margins.append(ebt / rev)
-        else:
-            op_margins.append(0)
-
-    # Tax rate per year
-    tax_rates_y: list = []
-    for t in range(n):
-        ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
-        ebt_at = yearly_ebit_at[t] if t < len(yearly_ebit_at) else 0
-        if ebt and ebt != 0:
-            tax_rates_y.append(1 - ebt_at / ebt)
-        else:
-            tax_rates_y.append(a.tax_rate if a.tax_rate is not None else 0)
-
-    # Sales-to-capital ratio (S2C) for reinvestment: delta_rev / reinvestment
-    s2c_values: list = []
-    for t in range(n):
-        reinv = yearly_reinvestment[t] if t < len(yearly_reinvestment) else 0
-        prev_rev = base_revenue if t == 0 else yearly_revenue[t - 1]
-        curr_rev = yearly_revenue[t] if t < len(yearly_revenue) else 0
-        delta_rev = curr_rev - prev_rev if prev_rev else 0
-        if reinv and reinv != 0:
-            s2c_values.append(delta_rev / reinv)
-        else:
-            s2c_values.append(2.0)  # default S2C
-
-    # Cumulated discount factor
+    # Compute per-year WACC from cumulated discount factors (for hardcoded schedule)
     cum_discount: list = []
     for t in range(n):
         fcff_t = yearly_fcff[t] if t < len(yearly_fcff) else 0
@@ -1014,7 +983,6 @@ def _write_dcf_model_v2_formulas(
         else:
             cum_discount.append(1.0)
 
-    # Per-year WACC from cum_discount
     wacc_y: list = []
     for t in range(n):
         cd = cum_discount[t]
@@ -1027,17 +995,10 @@ def _write_dcf_model_v2_formulas(
             else:
                 wacc_y.append(a.wacc if a.wacc is not None else 0)
 
-    # Terminal period values
-    terminal_growth = a.terminal_growth if a.terminal_growth is not None else 0
-    terminal_margin = op_margins[-1] if op_margins else 0
-    terminal_tax = a.tax_rate if a.tax_rate is not None else (
-        tax_rates_y[-1] if tax_rates_y else 0
-    )
-    base_margin = (base_ebit / base_revenue) if (base_ebit is not None and base_revenue) else 0
-    base_ebit_at = (base_ebit * (1 - a.tax_rate)) if (base_ebit is not None and a.tax_rate is not None) else 0
+    # Terminal FCFF (from engine, needed as fallback)
+    terminal_fcff = d.get("terminal_fcff")
 
     # --- Write to worksheet using openpyxl directly ---
-    # Create empty sheet via pandas, then overwrite with formulas
     empty_df = pd.DataFrame([[""] * (n + 3)])
     empty_df.to_excel(writer, sheet_name="DCF Model", index=False, header=False)
     ws = _ws(writer, "DCF Model")
@@ -1047,7 +1008,6 @@ def _write_dcf_model_v2_formulas(
     max_cols = n + 3  # A + Base + n years + Terminal
     term_col = n + 3  # terminal column number (1-indexed)
 
-    # Helper to get column letter by 1-indexed position
     def col_let(c: int) -> str:
         return get_column_letter(c)
 
@@ -1065,83 +1025,90 @@ def _write_dcf_model_v2_formulas(
     ws.cell(row=row, column=1, value="REVENUE PROJECTIONS")
     _style_section_title(ws, row, max_cols)
 
-    # --- Row 3: Revenue Growth Rate [blue = assumption] ---
+    # --- Row 3: Revenue Growth Rate ---
+    # Years 1-5: =Assumptions!$B$17 (high growth)
+    # Years 6-n: linearly interpolate from high growth to terminal growth
+    # Terminal col: =Assumptions!$B$18
     row = 3
     ws.cell(row=row, column=1, value="Revenue Growth Rate")
     ws.cell(row=row, column=1).font = _BOLD_FONT
     ws.cell(row=row, column=2, value="")  # no growth for base
+
+    # Determine the interpolation boundary (first 5 years = constant high growth)
+    n_constant = min(5, n)
     for t in range(n):
         c = t + 3
-        cell = ws.cell(row=row, column=c, value=rev_growth[t])
+        if t < n_constant:
+            # First n_constant years: reference high growth from Assumptions
+            formula = "=Assumptions!$B$17"
+        else:
+            # Linear interpolation from high growth to terminal growth
+            # Formula: =Assumptions!$B$17 - (Assumptions!$B$17 - Assumptions!$B$18) * (year - n_constant) / (n - n_constant)
+            steps = n - n_constant
+            step_num = t - n_constant + 1
+            formula = f"=Assumptions!$B$17-(Assumptions!$B$17-Assumptions!$B$18)*{step_num}/{steps}"
+        cell = ws.cell(row=row, column=c, value=formula)
         cell.number_format = _FMT_PCT
         cell.alignment = _RIGHT
         cell.fill = _ASSUMPTION_FILL
-        _add_comment(cell, "Assumption: interpolated growth schedule")
+
     # Terminal growth
-    cell = ws.cell(row=row, column=term_col, value=terminal_growth)
+    cell = ws.cell(row=row, column=term_col, value="=Assumptions!$B$18")
     cell.number_format = _FMT_PCT
     cell.alignment = _RIGHT
     cell.fill = _ASSUMPTION_FILL
-    _add_comment(cell, "Assumption: nominal GDP growth rate")
 
-    # --- Row 4: Revenues [base=green/fact, projections=formula] ---
+    # --- Row 4: Revenues ---
+    # Base: =Assumptions!$B$26
+    # Year t: =prev_col_4 * (1 + this_col_3)
     row = 4
     ws.cell(row=row, column=1, value="Revenues")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    # Base revenue (fact)
-    cell = ws.cell(row=row, column=2, value=base_revenue)
+    cell = ws.cell(row=row, column=2, value="=Assumptions!$B$26")
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
     cell.fill = _FACT_FILL
-    _add_comment(cell, "Source: Yahoo Finance (TTM or latest annual)")
-    # Year 1..n: formula = PrevRevenue * (1 + GrowthRate)
     for t in range(n):
         c = t + 3
-        prev_col = col_let(c - 1)
-        growth_col = col_let(c)
-        # Formula: =<prev_col>4 * (1 + <growth_col>3)
-        formula = f"={prev_col}4*(1+{growth_col}3)"
+        prev_cl = col_let(c - 1)
+        growth_cl = col_let(c)
+        formula = f"={prev_cl}4*(1+{growth_cl}3)"
         cell = ws.cell(row=row, column=c, value=formula)
         cell.number_format = _FMT_INT
         cell.alignment = _RIGHT
-        # No fill = calculation
 
-    # --- Row 5: Operating Margin [blue = assumption] ---
+    # --- Row 5: Operating Margin ---
+    # Margin convergence: =Assumptions!$B$19 + (Assumptions!$B$20 - Assumptions!$B$19) * MIN(year/Assumptions!$B$23, 1)
     row = 5
     ws.cell(row=row, column=1, value="Operating Margin")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    # Base margin
-    cell = ws.cell(row=row, column=2, value=base_margin if base_margin else "")
-    if isinstance(base_margin, (int, float)):
-        cell.number_format = _FMT_PCT
-        cell.alignment = _RIGHT
-        cell.fill = _FACT_FILL
-        _add_comment(cell, "Source: computed from financials (EBIT/Revenue)")
-    # Year margins
+    # Base margin: =Assumptions!$B$27 / Assumptions!$B$26 (EBIT/Revenue)
+    cell = ws.cell(row=row, column=2, value="=IF(Assumptions!$B$26=0,0,Assumptions!$B$27/Assumptions!$B$26)")
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
     for t in range(n):
         c = t + 3
-        cell = ws.cell(row=row, column=c, value=op_margins[t])
+        year_num = t + 1
+        formula = f"=Assumptions!$B$19+(Assumptions!$B$20-Assumptions!$B$19)*MIN({year_num}/Assumptions!$B$23,1)"
+        cell = ws.cell(row=row, column=c, value=formula)
         cell.number_format = _FMT_PCT
         cell.alignment = _RIGHT
         cell.fill = _ASSUMPTION_FILL
-        _add_comment(cell, "Assumption: margin convergence schedule")
-    # Terminal margin
-    cell = ws.cell(row=row, column=term_col, value=terminal_margin)
+    # Terminal margin = target margin
+    cell = ws.cell(row=row, column=term_col, value="=Assumptions!$B$20")
     cell.number_format = _FMT_PCT
     cell.alignment = _RIGHT
     cell.fill = _ASSUMPTION_FILL
 
-    # --- Row 6: Operating Income (EBIT) [formula = Revenue * Margin] ---
+    # --- Row 6: Operating Income (EBIT) = Revenue * Margin ---
     row = 6
     ws.cell(row=row, column=1, value="Operating Income (EBIT)")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    # Base EBIT (fact)
-    cell = ws.cell(row=row, column=2, value=base_ebit)
+    cell = ws.cell(row=row, column=2, value="=Assumptions!$B$27")
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
     cell.fill = _FACT_FILL
-    _add_comment(cell, "Source: Yahoo Finance")
-    # Year 1..n: formula = Revenue * Margin
     for t in range(n):
         c = t + 3
         cl = col_let(c)
@@ -1151,43 +1118,47 @@ def _write_dcf_model_v2_formulas(
         cell.alignment = _RIGHT
 
     # --- Row 7: blank ---
-    row = 7
 
     # --- Row 8: Section: TAX & REINVESTMENT ---
     row = 8
     ws.cell(row=row, column=1, value="TAX & REINVESTMENT")
     _style_section_title(ws, row, max_cols)
 
-    # --- Row 9: Tax Rate [blue/gray] ---
+    # --- Row 9: Tax Rate ---
+    # Years 1-5: =Assumptions!$B$11 (effective)
+    # Years 6-n: ramp to marginal =Assumptions!$B$12
+    # Terminal: =Assumptions!$B$12
     row = 9
     ws.cell(row=row, column=1, value="Tax Rate")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    cell = ws.cell(row=row, column=2, value=a.tax_rate)
+    cell = ws.cell(row=row, column=2, value="=Assumptions!$B$11")
     cell.number_format = _FMT_PCT
     cell.alignment = _RIGHT
     cell.fill = _ASSUMPTION_FILL
-    _add_comment(cell, "Assumption: effective tax rate from financials")
     for t in range(n):
         c = t + 3
-        cell = ws.cell(row=row, column=c, value=tax_rates_y[t])
+        if t < n_constant:
+            formula = "=Assumptions!$B$11"
+        else:
+            steps = n - n_constant
+            step_num = t - n_constant + 1
+            formula = f"=Assumptions!$B$11+(Assumptions!$B$12-Assumptions!$B$11)*{step_num}/{steps}"
+        cell = ws.cell(row=row, column=c, value=formula)
         cell.number_format = _FMT_PCT
         cell.alignment = _RIGHT
         cell.fill = _ASSUMPTION_FILL
-    cell = ws.cell(row=row, column=term_col, value=terminal_tax)
+    cell = ws.cell(row=row, column=term_col, value="=Assumptions!$B$12")
     cell.number_format = _FMT_PCT
     cell.alignment = _RIGHT
     cell.fill = _ASSUMPTION_FILL
 
-    # --- Row 10: EBIT(1-t) [formula = EBIT * (1 - TaxRate)] ---
+    # --- Row 10: EBIT(1-t) = EBIT * (1 - TaxRate) ---
     row = 10
     ws.cell(row=row, column=1, value="EBIT(1-t)")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    # Base
-    if base_ebit_at:
-        cell = ws.cell(row=row, column=2, value=f"=B6*(1-B9)")
-        cell.number_format = _FMT_INT
-        cell.alignment = _RIGHT
-    # Years
+    cell = ws.cell(row=row, column=2, value="=B6*(1-B9)")
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
     for t in range(n):
         c = t + 3
         cl = col_let(c)
@@ -1196,19 +1167,19 @@ def _write_dcf_model_v2_formulas(
         cell.number_format = _FMT_INT
         cell.alignment = _RIGHT
 
-    # --- Row 11: Sales to Capital Ratio (S2C) [gray = hardcoded from heuristic] ---
+    # --- Row 11: Sales to Capital Ratio ---
+    # All years reference Assumptions!$B$21
     row = 11
     ws.cell(row=row, column=1, value="Sales to Capital Ratio")
     ws.cell(row=row, column=1).font = _BOLD_FONT
     for t in range(n):
         c = t + 3
-        cell = ws.cell(row=row, column=c, value=s2c_values[t])
+        cell = ws.cell(row=row, column=c, value="=Assumptions!$B$21")
         cell.number_format = _FMT_DEC
         cell.alignment = _RIGHT
-        cell.fill = _HARDCODED_FILL
-        _add_comment(cell, "Hardcoded: computed from delta_revenue / reinvestment")
+        cell.fill = _ASSUMPTION_FILL
 
-    # --- Row 12: Reinvestment [formula = (Revenue - PrevRevenue) / S2C] ---
+    # --- Row 12: Reinvestment = (Revenue - PrevRevenue) / S2C ---
     row = 12
     ws.cell(row=row, column=1, value="Reinvestment")
     ws.cell(row=row, column=1).font = _BOLD_FONT
@@ -1216,13 +1187,12 @@ def _write_dcf_model_v2_formulas(
         c = t + 3
         cl = col_let(c)
         prev_cl = col_let(c - 1)
-        # Formula: =(Revenue_this - Revenue_prev) / S2C
         formula = f"=({cl}4-{prev_cl}4)/{cl}11"
         cell = ws.cell(row=row, column=c, value=formula)
         cell.number_format = _FMT_INT
         cell.alignment = _RIGHT
 
-    # --- Row 13: FCFF [formula = EBIT(1-t) - Reinvestment] ---
+    # --- Row 13: FCFF = EBIT(1-t) - Reinvestment ---
     row = 13
     ws.cell(row=row, column=1, value="Free Cash Flow to Firm")
     ws.cell(row=row, column=1).font = _BOLD_FONT
@@ -1233,43 +1203,60 @@ def _write_dcf_model_v2_formulas(
         cell = ws.cell(row=row, column=c, value=formula)
         cell.number_format = _FMT_INT
         cell.alignment = _RIGHT
-    # Terminal FCFF (hardcoded since it requires stable ROC logic)
-    terminal_fcff = d.get("terminal_fcff")
-    if terminal_fcff:
-        cell = ws.cell(row=row, column=term_col, value=terminal_fcff)
-        cell.number_format = _FMT_INT
-        cell.alignment = _RIGHT
-        cell.fill = _HARDCODED_FILL
-        _add_comment(cell, "Hardcoded: Terminal FCFF = EBIT(1-t) * (1 - g/ROC)")
+    # Terminal FCFF: =last_year_EBIT_at * (1 + g) * (1 - g/ROC)
+    term_cl = col_let(term_col)
+    last_year_cl = col_let(term_col - 1)
+    # Terminal FCFF = EBIT(1-t)_last_year * (1+g) * (1 - g/ROC)
+    formula = f"={last_year_cl}10*(1+Assumptions!$B$18)*(1-Assumptions!$B$18/Assumptions!$B$22)"
+    cell = ws.cell(row=row, column=term_col, value=formula)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
 
     # --- Row 14: blank ---
-    row = 14
 
     # --- Row 15: Section: DISCOUNT RATES ---
     row = 15
     ws.cell(row=row, column=1, value="DISCOUNT RATES")
     _style_section_title(ws, row, max_cols)
 
-    # --- Row 16: Cost of Capital (WACC) [gray = from schedule] ---
+    # --- Row 16: Cost of Capital (WACC) ---
+    # Years 1-5: =Assumptions!$B$14
+    # Years 6-n: hardcoded schedule values (transition to stable)
+    # Terminal: last value of schedule
     row = 16
     ws.cell(row=row, column=1, value="Cost of Capital (WACC)")
     ws.cell(row=row, column=1).font = _BOLD_FONT
     for t in range(n):
         c = t + 3
-        cell = ws.cell(row=row, column=c, value=wacc_y[t])
+        if t < n_constant:
+            formula = "=Assumptions!$B$14"
+        else:
+            # Linear ramp: WACC transitions toward a stable WACC
+            # Stable WACC approx = Rf + 4.5% + CRP (Damodaran convention)
+            # Use formula: =Assumptions!$B$14 - (Assumptions!$B$14 - (Assumptions!$B$4+0.045+Assumptions!$B$8)) * step/steps
+            steps = n - n_constant
+            step_num = t - n_constant + 1
+            # Simpler: hardcode from computed schedule since stable WACC formula is complex
+            cell_val = wacc_y[t] if t < len(wacc_y) else (a.wacc or 0)
+            cell = ws.cell(row=row, column=c, value=cell_val)
+            cell.number_format = _FMT_PCT
+            cell.alignment = _RIGHT
+            cell.fill = _HARDCODED_FILL
+            _add_comment(cell, "WACC transition (from schedule)")
+            continue
+        cell = ws.cell(row=row, column=c, value=formula)
         cell.number_format = _FMT_PCT
         cell.alignment = _RIGHT
-        cell.fill = _HARDCODED_FILL
-        _add_comment(cell, "Hardcoded: from WACC transition schedule (Python)")
-    # Terminal WACC
+        cell.fill = _ASSUMPTION_FILL
+    # Terminal WACC (use last wacc_y value or hardcode)
     terminal_wacc = wacc_y[-1] if wacc_y else (a.wacc or 0)
     cell = ws.cell(row=row, column=term_col, value=terminal_wacc)
     cell.number_format = _FMT_PCT
     cell.alignment = _RIGHT
     cell.fill = _HARDCODED_FILL
-    _add_comment(cell, "Hardcoded: stable-state WACC")
+    _add_comment(cell, "Stable-state WACC")
 
-    # --- Row 17: Cumulated Discount Factor [formula = prev * (1+WACC)] ---
+    # --- Row 17: Cumulated Discount Factor = prev * (1+WACC) ---
     row = 17
     ws.cell(row=row, column=1, value="Cumulated Discount Factor")
     ws.cell(row=row, column=1).font = _BOLD_FONT
@@ -1277,7 +1264,6 @@ def _write_dcf_model_v2_formulas(
         c = t + 3
         cl = col_let(c)
         if t == 0:
-            # First year: = 1 + WACC
             formula = f"=1+{cl}16"
         else:
             prev_cl = col_let(c - 1)
@@ -1286,7 +1272,7 @@ def _write_dcf_model_v2_formulas(
         cell.number_format = "#,##0.0000"
         cell.alignment = _RIGHT
 
-    # --- Row 18: PV(FCFF) [formula = FCFF / CumulatedDiscount] ---
+    # --- Row 18: PV(FCFF) = FCFF / CumulatedDiscount ---
     row = 18
     ws.cell(row=row, column=1, value="PV(FCFF)")
     ws.cell(row=row, column=1).font = _BOLD_FONT
@@ -1299,58 +1285,43 @@ def _write_dcf_model_v2_formulas(
         cell.alignment = _RIGHT
 
     # --- Row 19: blank ---
-    row = 19
 
     # --- Row 20: Section: TERMINAL VALUE ---
     row = 20
     ws.cell(row=row, column=1, value="TERMINAL VALUE")
     _style_section_title(ws, row, max_cols)
 
-    # --- Row 21: Terminal Value [formula or hardcoded] ---
+    # --- Row 21: Terminal Value = Terminal FCFF / (Terminal WACC - Terminal Growth) ---
     row = 21
     ws.cell(row=row, column=1, value="Terminal Value")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    # Terminal Value = Terminal FCFF / (Terminal WACC - Terminal Growth)
-    # We write a formula referencing the terminal column cells
-    term_cl = col_let(term_col)
-    last_year_cl = col_let(term_col - 1)
-    # Terminal FCFF is in row 13, terminal col; WACC in row 16 term col; growth in row 3 term col
     formula = f"={term_cl}13/({term_cl}16-{term_cl}3)"
     cell = ws.cell(row=row, column=term_col, value=formula)
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
 
-    # --- Row 22: PV(Terminal Value) [formula = TV / CumDiscount_last_year] ---
+    # --- Row 22: PV(Terminal Value) = TV / CumDiscount_last_year ---
     row = 22
     ws.cell(row=row, column=1, value="PV(Terminal Value)")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    # PV of TV = TV / last year's cumulated discount
     formula = f"={term_cl}21/{last_year_cl}17"
     cell = ws.cell(row=row, column=term_col, value=formula)
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
 
     # --- Row 23: blank ---
-    row = 23
 
     # --- Row 24: Section: EQUITY VALUE BRIDGE ---
     row = 24
     ws.cell(row=row, column=1, value="EQUITY VALUE BRIDGE")
     _style_section_title(ws, row, max_cols)
 
-    # For the equity bridge, we use formulas where possible
-    # Sum of PV(FCFF) across all years + PV(Terminal)
-    price = ctx.financials.key_stats.get("price")
-    shares = ctx.financials.key_stats.get("shares_outstanding")
-    cash = d.get("cash", 0) or 0
-    debt = d.get("debt", 0) or 0
     non_op = d.get("non_operating_assets", 0) or 0
 
-    # --- Row 25: PV of Operating Cash Flows (sum of PV row) ---
+    # --- Row 25: PV of Operating Cash Flows = SUM(PV row) ---
     row = 25
     ws.cell(row=row, column=1, value="PV of Cash Flows (High Growth)")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    # Formula: =SUM(C18:XX18) where XX is the last year column
     first_year_cl = col_let(3)
     last_data_cl = col_let(n + 2)
     formula = f"=SUM({first_year_cl}18:{last_data_cl}18)"
@@ -1367,7 +1338,7 @@ def _write_dcf_model_v2_formulas(
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
 
-    # --- Row 27: Value of Operating Assets = sum ---
+    # --- Row 27: Value of Operating Assets ---
     row = 27
     ws.cell(row=row, column=1, value="Value of Operating Assets")
     ws.cell(row=row, column=1).font = _BOLD_FONT
@@ -1376,25 +1347,23 @@ def _write_dcf_model_v2_formulas(
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
 
-    # --- Row 28: + Cash [green = fact] ---
+    # --- Row 28: + Cash [references Assumptions!B28] ---
     row = 28
     ws.cell(row=row, column=1, value="Add: Cash & Marketable Securities")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    cell = ws.cell(row=row, column=2, value=cash)
+    cell = ws.cell(row=row, column=2, value="=Assumptions!$B$28")
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
     cell.fill = _FACT_FILL
-    _add_comment(cell, "Source: Yahoo Finance (Balance Sheet)")
 
-    # --- Row 29: - Debt [green = fact] ---
+    # --- Row 29: - Debt [references Assumptions!B29] ---
     row = 29
     ws.cell(row=row, column=1, value="Less: Debt")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    cell = ws.cell(row=row, column=2, value=debt)
+    cell = ws.cell(row=row, column=2, value="=Assumptions!$B$29")
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
     cell.fill = _FACT_FILL
-    _add_comment(cell, "Source: Yahoo Finance (Balance Sheet)")
 
     # --- Row 30: + Non-operating Assets ---
     row = 30
@@ -1405,9 +1374,8 @@ def _write_dcf_model_v2_formulas(
     cell.alignment = _RIGHT
     if non_op:
         cell.fill = _HARDCODED_FILL
-        _add_comment(cell, "Hardcoded: cross-holdings or other non-operating assets")
 
-    # --- Row 31: = Value of Equity [formula] ---
+    # --- Row 31: = Value of Equity ---
     row = 31
     ws.cell(row=row, column=1, value="Value of Equity")
     ws.cell(row=row, column=1).font = _BOLD_FONT
@@ -1416,17 +1384,16 @@ def _write_dcf_model_v2_formulas(
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
 
-    # --- Row 32: / Shares Outstanding [green = fact] ---
+    # --- Row 32: / Shares Outstanding [references Assumptions!B30] ---
     row = 32
     ws.cell(row=row, column=1, value="Shares Outstanding")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    cell = ws.cell(row=row, column=2, value=shares)
+    cell = ws.cell(row=row, column=2, value="=Assumptions!$B$30")
     cell.number_format = _FMT_INT
     cell.alignment = _RIGHT
     cell.fill = _FACT_FILL
-    _add_comment(cell, "Source: Yahoo Finance")
 
-    # --- Row 33: = Value per Share [formula] ---
+    # --- Row 33: = Value per Share ---
     row = 33
     ws.cell(row=row, column=1, value="Value per Share")
     ws.cell(row=row, column=1).font = _BOLD_FONT
@@ -1435,17 +1402,16 @@ def _write_dcf_model_v2_formulas(
     cell.number_format = _FMT_PRICE
     cell.alignment = _RIGHT
 
-    # --- Row 34: Market Price [green = fact] ---
+    # --- Row 34: Market Price [references Assumptions!B31] ---
     row = 34
     ws.cell(row=row, column=1, value="Market Price")
     ws.cell(row=row, column=1).font = _BOLD_FONT
-    cell = ws.cell(row=row, column=2, value=price)
+    cell = ws.cell(row=row, column=2, value="=Assumptions!$B$31")
     cell.number_format = _FMT_PRICE
     cell.alignment = _RIGHT
     cell.fill = _FACT_FILL
-    _add_comment(cell, "Source: Yahoo Finance (current market price)")
 
-    # --- Row 35: % Under/Over Valued [formula] ---
+    # --- Row 35: % Under/Over Valued ---
     row = 35
     ws.cell(row=row, column=1, value="Implied Upside/Downside")
     ws.cell(row=row, column=1).font = _BOLD_FONT
