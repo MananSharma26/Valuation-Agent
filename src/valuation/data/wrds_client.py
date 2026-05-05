@@ -46,6 +46,7 @@ class WRDSClient:
 
         Converts %(name)s style params (used by wrds library / psycopg2)
         to :name style (used by sqlalchemy.text).
+        Rolls back on error to prevent poisoned transaction state.
         """
         import re
         import sqlalchemy
@@ -55,7 +56,15 @@ class WRDSClient:
         # Convert %(name)s → :name for sqlalchemy.text()
         converted_query = re.sub(r'%\((\w+)\)s', r':\1', query)
 
-        return pd.read_sql(sqlalchemy.text(converted_query), conn, params=params)
+        try:
+            return pd.read_sql(sqlalchemy.text(converted_query), conn, params=params)
+        except Exception:
+            # Rollback to clear failed transaction state
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def close(self):
         if self._db is not None:
@@ -248,9 +257,9 @@ class WRDSClient:
                     estimid
                 FROM tr_ibes.ptgdet
                 WHERE ticker = %(ticker)s
-                  AND amaskcd = ANY(%(ids)s)
+                  AND amaskcd IN :ids
                 ORDER BY amaskcd, revdats DESC, revtims DESC
-            """, params={"ticker": ticker, "ids": analyst_ids})
+            """, params={"ticker": ticker, "ids": tuple(analyst_ids)})
         except Exception:
             names_df = pd.DataFrame(columns=["amaskcd", "alysnam", "estimid"])
 
@@ -263,10 +272,10 @@ class WRDSClient:
                     value AS target
                 FROM tr_ibes.ptgdet
                 WHERE ticker = %(ticker)s
-                  AND amaskcd = ANY(%(ids)s)
+                  AND amaskcd IN :ids
                   AND value IS NOT NULL
                 ORDER BY amaskcd, revdats DESC, revtims DESC
-            """, params={"ticker": ticker, "ids": analyst_ids})
+            """, params={"ticker": ticker, "ids": tuple(analyst_ids)})
         except Exception:
             targets_df = pd.DataFrame(columns=["amaskcd", "target"])
 
@@ -278,9 +287,9 @@ class WRDSClient:
                     irec
                 FROM tr_ibes.recddet
                 WHERE ticker = %(ticker)s
-                  AND amaskcd = ANY(%(ids)s)
+                  AND amaskcd IN :ids
                 ORDER BY amaskcd, revdats DESC, revtims DESC
-            """, params={"ticker": ticker, "ids": analyst_ids})
+            """, params={"ticker": ticker, "ids": tuple(analyst_ids)})
         except Exception:
             recs_df = pd.DataFrame(columns=["amaskcd", "irec"])
 
