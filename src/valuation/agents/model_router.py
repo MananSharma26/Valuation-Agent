@@ -30,10 +30,17 @@ def select_model(ctx: ValuationContext) -> ModelSelection:
     growth = ctx.assumptions.growth_rates[0] if ctx.assumptions.growth_rates else 0
 
     if classification == "financial":
+        # Check if dividends significantly differ from FCFE (use FCFE model instead of DDM)
+        if div_yield < 0.02:
+            return ModelSelection(
+                primary_model="fcfe",
+                secondary_models=["ddm"],
+                reasoning="Financial firm but very low dividend payout — FCFE better captures value than DDM",
+            )
         return ModelSelection(
             primary_model="ddm",
             secondary_models=["excess_returns"],
-            reasoning="Financial firm — debt is raw material, use DDM + excess returns",
+            reasoning="Financial firm with regular dividends — DDM + excess returns",
         )
 
     if classification == "mature":

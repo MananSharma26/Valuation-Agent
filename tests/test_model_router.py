@@ -3,9 +3,19 @@ from valuation.context import ValuationContext
 from valuation.agents.model_router import select_model, ModelSelection
 
 
-def test_financial_routes_to_ddm():
+def test_financial_low_dividend_routes_to_fcfe():
     ctx = ValuationContext(ticker="TEST")
     ctx.company.classification = "financial"
+    # No dividend info -> div_yield = 0 < 0.02 -> FCFE
+    result = select_model(ctx)
+    assert result.primary_model == "fcfe"
+    assert "ddm" in result.secondary_models
+
+
+def test_financial_high_dividend_routes_to_ddm():
+    ctx = ValuationContext(ticker="TEST")
+    ctx.company.classification = "financial"
+    ctx.financials.key_stats = {"dividend_per_share": 5, "price": 100}  # 5% yield
     result = select_model(ctx)
     assert result.primary_model == "ddm"
     assert "excess_returns" in result.secondary_models

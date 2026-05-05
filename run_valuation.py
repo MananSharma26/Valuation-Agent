@@ -443,8 +443,14 @@ def run(ticker: str, growth_override: float | None = None,
     # Country risk is added via CRP × Lambda, NOT embedded in Rf
     # This allows terminal growth (5% for India) < Rf + CRP without violating the cap
     if is_india:
-        rf = live_rf if (live_rf and 0.01 < live_rf < 0.10) else (damodaran_rf or 0.0418)
-        crp = damodaran_crp or 0.032  # India CRP from Damodaran ctryprem.xlsx
+        # Damodaran lecture (dcfrates.pdf slide 33):
+        # India Rf in INR = India govt bond yield - sovereign default spread
+        # This gives a risk-free rate in the LOCAL CURRENCY without double-counting
+        # sovereign risk (CRP is added separately via Lambda).
+        india_bond_yield = 0.07  # approximate India 10yr govt bond yield
+        india_default_spread = damodaran_country_default_spread or 0.0209  # from ctryprem.xlsx
+        rf = india_bond_yield - india_default_spread  # ~4.9% in INR
+        crp = damodaran_crp or 0.032  # India CRP from Damodaran ctryprem.xlsx (separate from default spread)
         # Lambda: firm-specific country risk exposure
         # Damodaran's approach: Lambda ≈ domestic revenue / total revenue
         # Primary: try WRDS Compustat geographic segments
@@ -503,7 +509,7 @@ def run(ticker: str, growth_override: float | None = None,
             else:
                 lam = 0.8  # Default: mostly domestic
             print(f"  Lambda: {lam} (sector heuristic: {sector}/{industry})")
-        print(f"  Rf: {rf:.2%} (US Treasury — Damodaran convention) | CRP: {crp:.2%} × Lambda: {lam}")
+        print(f"  Rf: {rf:.2%} (INR: bond yield {india_bond_yield:.2%} - default spread {india_default_spread:.2%}) | CRP: {crp:.2%} × Lambda: {lam}")
     elif is_japan:
         rf = 0.01  # Japan has its own yield curve
         crp = damodaran_crp or 0.0
@@ -594,7 +600,7 @@ def run(ticker: str, growth_override: float | None = None,
         print(f"  Industry growth benchmark: {ctx.benchmarks.industry_growth}")
 
     # Determine growth
-    n_years = 10
+    # Growth period length (Damodaran: depends on size, growth rate, barriers)
     is_india = ctx.company.region == "India"
     default_terminal = 0.05 if is_india else 0.025
     terminal_growth = terminal_override if terminal_override is not None else default_terminal
@@ -669,6 +675,17 @@ def run(ticker: str, growth_override: float | None = None,
     print(f"  Candidates: {', '.join(f'{k}={v:.2%}' for k, v in candidates.items())}")
     if industry_g:
         print(f"  Industry benchmark: {industry_g:.2%}")
+
+    # Variable growth period (Damodaran: depends on classification, growth rate, barriers)
+    if ctx.company.classification == "mature" and high_growth < 0.05:
+        n_years = 5  # stable companies: short growth period
+    elif ctx.company.classification == "growth" and high_growth > 0.20:
+        n_years = 10  # high growth with barriers: longer period
+    elif ctx.company.classification in ("mature", "cyclical"):
+        n_years = 5  # moderate growth: 5-year period
+    else:
+        n_years = 10  # default
+    print(f"  Growth period: {n_years} years")
 
     growth_rates = interpolate_params(high_growth, terminal_growth, n_years, gradual=True)
     ctx.assumptions.growth_rates = growth_rates
