@@ -185,13 +185,37 @@ def _propose_wacc(ctx: ValuationContext) -> Proposal | None:
     if bm.industry_wacc and abs(a.wacc - bm.industry_wacc) > 0.02:
         confidence = 0.5
 
-    reasoning = ". ".join(reasoning_parts)
-
     industry_str = f" Industry average is {bm.industry_wacc:.2%}." if bm.industry_wacc else ""
     question = (
         f"WACC is {a.wacc:.2%}.{industry_str} "
         f"Keep {a.wacc:.2%} or adjust? [keep / adjust to ___]"
     )
+
+    # Check if company beta differs significantly from industry beta
+    yf_beta = ctx.financials.key_stats.get("beta")
+    rf = a.risk_free_rate or 0.0
+    erp = a.erp or 0.0446
+    lam = 1.0
+    crp = a.country_risk_premium or 0.0
+    if yf_beta and a.beta and abs(a.beta - yf_beta) / a.beta > 0.30:
+        reasoning_parts.append(
+            f"⚠ Company regression beta ({yf_beta:.2f}) is very different from "
+            f"our industry beta ({a.beta:.2f}). Using company beta would give WACC ~{rf + yf_beta * erp + lam * crp:.1%} "
+            f"vs current {a.wacc:.1%}"
+        )
+        references.append("Yahoo Finance regression beta")
+        confidence = "low"
+
+        # Update question to be more pointed
+        alt_wacc = rf + yf_beta * (erp + crp)
+        question = (
+            f"WACC is {a.wacc:.2%} (industry beta {a.beta:.2f}). "
+            f"But company's own beta is {yf_beta:.2f} — "
+            f"using it would give WACC ~{alt_wacc:.1%}.{industry_str} "
+            f"Use industry beta or company beta? [industry {a.wacc:.2%} / company ~{alt_wacc:.1%} / blend ___]"
+        )
+
+    reasoning = ". ".join(reasoning_parts)
 
     return Proposal(
         parameter="wacc",

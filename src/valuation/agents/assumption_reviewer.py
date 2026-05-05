@@ -26,6 +26,11 @@ def review_assumptions(ctx: ValuationContext) -> list[dict]:
     bm = ctx.benchmarks
     profile = ctx.financials.key_stats.get("company_profile") or {}
 
+    # Get financial data
+    total_debt = 0
+    if ctx.financials.balance_sheet is not None and len(ctx.financials.balance_sheet) > 0:
+        total_debt = float(ctx.financials.balance_sheet.iloc[0].get('Total Debt', 0) or 0)
+
     # 1. WACC vs industry
     if a.wacc and bm.industry_wacc:
         diff = a.wacc - bm.industry_wacc
@@ -120,18 +125,33 @@ def review_assumptions(ctx: ValuationContext) -> list[dict]:
 
     # 4. Beta vs company beta from yfinance
     yf_beta = ctx.financials.key_stats.get("beta")
-    if a.beta and yf_beta and abs(a.beta - yf_beta) > 0.3:
-        reviews.append({
-            "field": "beta",
-            "value": a.beta,
-            "benchmark": yf_beta,
-            "flag": "mismatch",
-            "comment": (
-                f"Our beta ({a.beta:.2f}, bottom-up) differs from yfinance regression beta "
-                f"({yf_beta:.2f}) by {abs(a.beta - yf_beta):.2f}"
-            ),
-            "severity": "info",
-        })
+    if a.beta and yf_beta:
+        diff = abs(a.beta - yf_beta)
+        relative_diff = diff / a.beta if a.beta > 0 else 0
+        if relative_diff > 0.40:  # >40% difference is critical
+            reviews.append({
+                "field": "beta",
+                "value": a.beta,
+                "benchmark": yf_beta,
+                "flag": "mismatch",
+                "comment": (
+                    f"CRITICAL: Our beta ({a.beta:.2f}, industry bottom-up) is {relative_diff:.0%} different "
+                    f"from company's regression beta ({yf_beta:.2f}). "
+                    f"This alone swings value by {relative_diff*3:.0%}+. "
+                    f"Consider: is this company atypical for its industry? "
+                    f"(e.g., government-backed, monopoly, zero debt, locked-in revenue)"
+                ),
+                "severity": "critical",
+            })
+        elif diff > 0.3:
+            reviews.append({
+                "field": "beta",
+                "value": a.beta,
+                "benchmark": yf_beta,
+                "flag": "mismatch",
+                "comment": f"Our beta ({a.beta:.2f}) differs from yfinance ({yf_beta:.2f}) by {diff:.2f}",
+                "severity": "warning",
+            })
 
     # 5. Classification check
     cls = ctx.company.classification
@@ -194,6 +214,96 @@ def review_assumptions(ctx: ValuationContext) -> list[dict]:
                 ),
                 "severity": "critical",
             })
+
+    # 8. Government/PSU check — these companies often trade at much lower betas
+    country = ctx.financials.key_stats.get("country") or ""
+    company_name = (ctx.company.name or "").lower()
+    industry = (ctx.financials.key_stats.get("industry_yfinance") or "").lower()
+
+    is_psu_indicators = any([
+        "limited" in company_name and country == "India",  # Most Indian PSUs end in "Limited"
+        "hindustan" in company_name,
+        "bharat" in company_name,
+        "national" in company_name and country == "India",
+        "indian" in company_name.split()[0:1],
+    ])
+
+    if is_psu_indicators and a.beta and a.beta > 1.0:
+        reviews.append({
+            "field": "company_type",
+            "value": "possible_PSU",
+            "benchmark": None,
+            "flag": "mismatch",
+            "comment": (
+                f"Company name suggests a government/PSU entity. "
+                f"Indian PSUs typically trade at beta 0.2-0.6 (government backing, monopoly). "
+                f"Our beta ({a.beta:.2f}) uses industry average which may be too high. "
+                f"Consider using company regression beta or a PSU-adjusted beta."
+            ),
+            "severity": "warning",
+        })
+
+    # 9. Zero debt anomaly — zero-debt companies may warrant lower beta
+    if total_debt == 0 and a.beta and a.beta > 1.2:
+        reviews.append({
+            "field": "leverage_risk",
+            "value": a.beta,
+            "benchmark": 0,
+            "flag": "high",
+            "comment": (
+                f"Company has ZERO debt but beta is {a.beta:.2f}. "
+                f"Since beta is re-levered from industry (which has avg debt), "
+                f"a zero-debt company should have lower operating risk. "
+                f"The unlevered beta ({ctx.benchmarks.industry_unlevered_beta:.2f}) may be more appropriate."
+                if ctx.benchmarks.industry_unlevered_beta
+                else (
+                    f"Company has ZERO debt but beta is {a.beta:.2f}. "
+                    f"Since beta is re-levered from industry (which has avg debt), "
+                    f"a zero-debt company should have lower operating risk."
+                )
+            ),
+            "severity": "info",
+        })
+
+    # 10. Locked-in revenue / order book — check if WACC is appropriate
+    transcript = ctx.financials.key_stats.get("earnings_transcript")
+    if transcript and a.wacc and a.wacc > 0.12:
+        text = transcript.get("transcript_text", "").lower()
+        order_keywords = ["order book", "order backlog", "locked in", "visibility", "pipeline"]
+        if any(kw in text for kw in order_keywords):
+            reviews.append({
+                "field": "revenue_visibility",
+                "value": a.wacc,
+                "benchmark": None,
+                "flag": "high",
+                "comment": (
+                    f"Earnings call mentions order book/backlog/visibility. "
+                    f"High revenue visibility reduces risk — current WACC ({a.wacc:.2%}) may be too high. "
+                    f"Companies with locked-in revenue often warrant lower discount rates."
+                ),
+                "severity": "warning",
+            })
+
+    # 11. Implied ROC check — growth destroys value if ROC < WACC
+    if ctx.outputs.dcf_fcff:
+        yearly_roic = ctx.outputs.dcf_fcff.get("yearly_roic", [])
+        if yearly_roic and a.wacc:
+            avg_roic = sum(yearly_roic[:5]) / len(yearly_roic[:5]) if yearly_roic[:5] else 0
+            if avg_roic > 0 and avg_roic < a.wacc:
+                reviews.append({
+                    "field": "value_creation",
+                    "value": avg_roic,
+                    "benchmark": a.wacc,
+                    "flag": "mismatch",
+                    "comment": (
+                        f"CRITICAL: Implied ROIC ({avg_roic:.1%}) is BELOW WACC ({a.wacc:.2%}). "
+                        f"This means growth DESTROYS value in the DCF. "
+                        f"Either the Sales-to-Capital ratio is too low (needs more revenue per unit of capital), "
+                        f"or WACC is too high, or margins are too low. "
+                        f"The market clearly disagrees — check your S2C and beta assumptions."
+                    ),
+                    "severity": "critical",
+                })
 
     return reviews
 

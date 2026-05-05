@@ -356,6 +356,7 @@ def run(ticker: str, growth_override: float | None = None,
 
     # Country risk premium from ctryprem.xlsx
     damodaran_crp = 0.0
+    damodaran_country_default_spread = 0.0
     country_name = ctx.financials.key_stats.get("country") or ""
     if country_name and country_name != "United States":
         try:
@@ -365,6 +366,10 @@ def run(ticker: str, growth_override: float | None = None,
             row = df_crp[df_crp[country_col].str.contains(country_name, case=False, na=False)]
             if len(row) > 0:
                 damodaran_crp = float(row.iloc[0][crp_col])
+                # Also capture country default spread (for cost of debt)
+                spread_col = [c for c in df_crp.columns if "Default Spread" in c and "Rating" in c]
+                if spread_col:
+                    damodaran_country_default_spread = float(row.iloc[0][spread_col[0]])
         except Exception:
             pass
 
@@ -462,7 +467,7 @@ def run(ticker: str, growth_override: float | None = None,
 
     ke = compute_cost_of_equity(rf, beta, erp, crp, lam)
     rating, spread = get_synthetic_rating(icr, "large")
-    cod = rf + spread
+    cod = rf + damodaran_country_default_spread + spread  # include country default spread for non-US
     eq_w = market_cap / (market_cap + total_debt) if (market_cap + total_debt) > 0 else 1.0
     dbt_w = 1 - eq_w
     wacc = compute_wacc(ke, cod, tax_rate, eq_w, dbt_w)
@@ -485,9 +490,35 @@ def run(ticker: str, growth_override: float | None = None,
     sourced_inputs["erp"] = from_damodaran(erp, "histimpl.xls")
     sourced_inputs["beta"] = computed(beta, "Industry unlevered beta re-levered")
     sourced_inputs["cost_of_equity"] = computed(ke, "CAPM: Rf + beta*(ERP+CRP)")
-    sourced_inputs["cost_of_debt"] = computed(cod, "Rf + synthetic spread from ICR")
+    sourced_inputs["cost_of_debt"] = computed(cod, "Rf + country default spread + synthetic spread from ICR")
     sourced_inputs["wacc"] = computed(wacc, "Ke*E/(D+E) + Kd*(1-t)*D/(D+E)")
     sourced_inputs["tax_rate"] = computed(tax_rate, "Tax Provision / Pretax Income")
+
+    # Operating lease adjustment (if lease/rent expense available)
+    lease_debt = 0.0
+    lease_ebit_adj = 0.0
+    try:
+        for col in inc.columns:
+            if 'lease' in col.lower() or 'rent' in col.lower() or 'operating lease' in col.lower():
+                lease_exp = abs(float(latest_inc.get(col, 0) or 0))
+                if lease_exp > 0:
+                    from valuation.engines.adjustments import estimate_lease_debt
+                    lease_result = estimate_lease_debt(lease_exp, cod)
+                    lease_debt = lease_result["lease_debt"]
+                    lease_ebit_adj = lease_result["ebit_adjustment"]
+                    total_debt += lease_debt  # Add to total debt
+                    print(f"  Operating lease debt: {lease_debt:,.0f} (from '{col}', expense: {lease_exp:,.0f})")
+                    break
+    except Exception:
+        pass
+
+    # Options deduction (if data available)
+    # yfinance doesn't reliably provide options data
+    # For now, flag if company is likely to have significant ESOP
+    if ctx.company.sector and "technology" in ctx.company.sector.lower():
+        # Tech companies often have 2-5% dilution from options
+        # TODO: implement when actual option data source is available
+        pass
 
     # ================================================================
     # STEP 6: Growth Estimation
@@ -522,6 +553,14 @@ def run(ticker: str, growth_override: float | None = None,
     if terminal_override is not None:
         ctx.assumptions.set_override("terminal_growth", terminal_growth,
             f"CLI override: terminal growth set to {terminal_override}")
+
+    # Cap terminal growth at risk-free rate (Damodaran's rule)
+    if terminal_growth > rf:
+        print(f"  WARNING: Terminal growth ({terminal_growth:.2%}) > Rf ({rf:.2%}) — capping at Rf")
+        terminal_growth = rf
+        if terminal_override is not None:
+            ctx.assumptions.set_override("terminal_growth", terminal_growth,
+                f"Capped at Rf ({rf:.2%}) per Damodaran rule — original override was {terminal_override:.2%}")
 
     # Smart growth selection (Damodaran hierarchy)
     rev_g = growth_dict.get("historical_revenue")
@@ -835,6 +874,20 @@ def run(ticker: str, growth_override: float | None = None,
         print(f"  Bounds WARN: {bc.message}")
     for bc in bounds_report.halts:
         print(f"  Bounds HALT: {bc.message}")
+
+    # ================================================================
+    # STEP 8.5: Post-Engine Assumption Review (needs DCF output for ROIC check)
+    # ================================================================
+    try:
+        from valuation.agents.assumption_reviewer import review_assumptions
+        post_reviews = review_assumptions(ctx)
+        # Only print NEW critical issues not already shown (value_creation and revenue_visibility)
+        new_criticals = [r for r in post_reviews if r["severity"] == "critical"
+                        and r["field"] in ("value_creation", "revenue_visibility")]
+        for r in new_criticals:
+            print(f"  ✗ POST-ENGINE: {r['comment']}")
+    except Exception:
+        pass
 
     # ================================================================
     # STEP 9: Sensitivity Analysis

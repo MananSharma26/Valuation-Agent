@@ -63,3 +63,42 @@ def get_amortization_period(industry: str) -> int:
     if "retail" in industry_lower:
         return 3
     return 5  # default
+
+
+def estimate_lease_debt(
+    lease_expense: float,
+    cost_of_debt: float,
+    avg_lease_life: float = 8.0,
+) -> dict:
+    """Estimate the debt value of operating leases.
+
+    Damodaran approximation: PV of lease payments ≈ lease_expense × annuity factor
+    Annuity factor = (1 - (1+r)^-n) / r
+
+    Args:
+        lease_expense: Annual operating lease/rent expense
+        cost_of_debt: Pre-tax cost of debt (for discounting)
+        avg_lease_life: Average remaining lease life (default 8 years)
+
+    Returns dict with:
+        lease_debt: PV of lease commitments (treat as debt)
+        depreciation: lease_debt / avg_lease_life (lease depreciation)
+        ebit_adjustment: lease_expense - depreciation (added to EBIT)
+    """
+    if lease_expense <= 0 or cost_of_debt <= 0:
+        return {"lease_debt": 0, "depreciation": 0, "ebit_adjustment": 0}
+
+    # Annuity factor
+    r = cost_of_debt
+    n = avg_lease_life
+    annuity_factor = (1 - (1 + r) ** (-n)) / r
+
+    lease_debt = lease_expense * annuity_factor
+    depreciation = lease_debt / n
+    ebit_adjustment = lease_expense - depreciation
+
+    return {
+        "lease_debt": lease_debt,
+        "depreciation": depreciation,
+        "ebit_adjustment": ebit_adjustment,
+    }
