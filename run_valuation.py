@@ -1403,6 +1403,25 @@ def run(ticker: str, growth_override: float | None = None,
     if ee.get("growth", {}).get("+1y"):
         print(f"  Consensus EPS Growth (NY):  {ee['growth']['+1y']:.1%}")
 
+    # Top accuracy-ranked analysts with targets (from I/B/E/S via WRDS)
+    ibes = ctx.financials.key_stats.get("ibes_data") or {}
+    top_analysts = ibes.get("top_analysts")
+    if top_analysts is not None and len(top_analysts) > 0:
+        print(f"\n  TOP ANALYSTS (ranked by forecast accuracy)")
+        try:
+            for _, row in top_analysts.head(5).iterrows():
+                name = str(row.get('analyst_name', '')).strip()[:20]
+                firm = str(row.get('firm', '')).strip()[:12]
+                acc = row.get('accuracy_pct')
+                target = row.get('target')
+                rec = str(row.get('recommendation', '')).strip()
+                acc_str = f"{acc:.0%}" if acc and acc == acc else "N/A"
+                tgt_str = f"{target:>8,.0f}" if target and target == target else "     N/A"
+                rec_str = rec if rec and rec != 'nan' else ""
+                print(f"  {name:20s} {firm:12s} Acc:{acc_str:>4s}  Target:{tgt_str}  {rec_str}")
+        except Exception:
+            pass
+
     print(f"\n  {'─'*50}")
     if ctx.confidence.composite:
         print(f"  Confidence:                 {ctx.confidence.composite:.0%}")
