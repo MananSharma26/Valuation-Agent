@@ -4,7 +4,13 @@ Produces a structured Excel file similar to Damodaran's example spreadsheets,
 with sheets for: Summary, Assumptions, DCF Model, Relative Valuation,
 Sensitivity, Analyst Consensus, and Data Sources.
 
-All formatting is deterministic Python — no LLM calls.
+Color coding convention:
+  - Light green (#E8F5E9): Facts/data from sources (revenue, net income, price)
+  - Light blue (#E3F2FD): Assumptions (growth rate, WACC, beta, terminal growth)
+  - No color: Calculations (EBIT(1-t), FCFF, PV, terminal value)
+  - Light gray (#F5F5F5): Hardcoded values from formulas/heuristics
+
+All formatting is deterministic Python -- no LLM calls.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -29,8 +36,13 @@ _LIGHT_GRAY = "D9D9D9"      # section-title background
 _WHITE = "FFFFFF"
 _GREEN = "00B050"            # positive upside
 _RED = "FF0000"              # negative
-_LIGHT_GREEN_BG = "E2EFDA"  # highlight base-case cell background
-_YELLOW_BG = "FFFF00"       # base-case cell fill
+_YELLOW_BG = "FFFF00"       # base-case cell fill in sensitivity
+
+# NEW: semantic color fills
+_FACT_FILL = PatternFill("solid", fgColor="E8F5E9")       # light green - facts/data
+_ASSUMPTION_FILL = PatternFill("solid", fgColor="E3F2FD")  # light blue - assumptions
+_HARDCODED_FILL = PatternFill("solid", fgColor="F5F5F5")   # light gray - hardcoded
+# No fill for calculations (they use formulas)
 
 _HEADER_FONT = Font(name="Calibri", bold=True, size=12, color=_WHITE)
 _SECTION_FONT = Font(name="Calibri", bold=True, size=11, color="000000")
@@ -75,6 +87,11 @@ def _safe(val: Any, fmt: str = ",.2f") -> Any:
 def _ws(writer: pd.ExcelWriter, sheet_name: str):
     """Return the openpyxl worksheet for the given sheet name."""
     return writer.sheets[sheet_name]
+
+
+def _hide_gridlines(ws) -> None:
+    """Turn off gridlines on the worksheet."""
+    ws.sheet_view.showGridLines = False
 
 
 def _style_header_row(ws, row: int, n_cols: int) -> None:
@@ -156,6 +173,27 @@ def _apply_upside_color(cell) -> None:
         cell.font = Font(name="Calibri", size=10, color=_RED)
 
 
+def _add_comment(cell, text: str) -> None:
+    """Add a comment/note to a cell."""
+    cell.comment = Comment(text, "Valuation Agent")
+
+
+def _safe_label(label: str) -> str:
+    """Ensure a row label doesn't start with =, -, +, @ (which Excel interprets as formula)."""
+    if isinstance(label, str) and label.strip() and label.strip()[0] in ("=", "-", "+", "@"):
+        # Prefix with a space or rewrite
+        stripped = label.strip()
+        if stripped.startswith("= "):
+            return stripped[2:]  # Remove "= " prefix
+        elif stripped.startswith("- "):
+            return "Less: " + stripped[2:]
+        elif stripped.startswith("+ "):
+            return "Add: " + stripped[2:]
+        else:
+            return "'" + label  # Escape with apostrophe
+    return label
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -212,7 +250,7 @@ def generate_excel(
 # ---------------------------------------------------------------------------
 
 def _write_summary(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
-    """Sheet 1: Executive Summary — key results at a glance."""
+    """Sheet 1: Executive Summary -- key results at a glance."""
     a = ctx.assumptions
     price = ctx.financials.key_stats.get("price")
 
@@ -327,19 +365,25 @@ def _write_summary(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
     df.to_excel(writer, sheet_name="Summary", index=False)
 
     ws = _ws(writer, "Summary")
+    _hide_gridlines(ws)
 
     # Company name as prominent title in A1 (merged)
     company_label = ctx.company.name or ctx.company.ticker
-    ws.cell(row=1, column=1).value = f"Valuation Report — {company_label}"
+    ws.cell(row=1, column=1).value = f"Valuation Report \u2014 {company_label}"
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
     ws.cell(row=1, column=1).font = Font(name="Calibri", bold=True, size=14, color=_WHITE)
     ws.cell(row=1, column=1).fill = _HEADER_FILL
     ws.cell(row=1, column=1).alignment = _CENTER
 
-    # Walk through and apply styles
+    # Walk through and apply styles + color coding
     pct_labels = {"risk-free rate", "equity risk premium", "beta", "cost of equity",
                   "wacc", "terminal growth", "data completeness", "model agreement",
                   "assumption sensitivity", "composite score", "implied upside/downside"}
+
+    # Track which rows are facts vs assumptions for color coding
+    fact_labels = {"current price", "market cap", "shares outstanding"}
+    assumption_labels = {"risk-free rate", "equity risk premium", "beta",
+                         "cost of equity", "wacc", "terminal growth"}
 
     for row_idx in range(2, ws.max_row + 1):
         label_cell = ws.cell(row=row_idx, column=1)
@@ -355,8 +399,16 @@ def _write_summary(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
         # Value cell
         val_cell = ws.cell(row=row_idx, column=2)
         val = val_cell.value
+        label_lower = str(label).lower()
+
+        # Apply color coding
+        if label_lower in fact_labels:
+            val_cell.fill = _FACT_FILL
+            _add_comment(val_cell, "Source: Yahoo Finance")
+        elif label_lower in assumption_labels:
+            val_cell.fill = _ASSUMPTION_FILL
+
         if isinstance(val, (int, float)):
-            label_lower = label.lower()
             if label_lower in pct_labels and abs(val) <= 3:
                 val_cell.number_format = _FMT_PCT
             elif label_lower in ("current price", "value range (low)", "value range (high)", "mean"):
@@ -375,13 +427,6 @@ def _write_summary(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                 _apply_upside_color(upside_cell)
                 upside_cell.alignment = _RIGHT
 
-    # Row 1 is now our merged title; the old header row (DataFrame headers) is row 2
-    # Style the DataFrame header row (first row of the DataFrame = row 2 in worksheet
-    # because to_excel writes header at row index 0 → Excel row 1, but we overwrote it)
-    # Actually to_excel with index=False writes header at row 1, data from row 2.
-    # We replaced row 1's content with the merged title above.
-    # The column headers from df are ALREADY in row 1; we overwrote A1 with our title.
-    # Re-apply header style to row 1 for columns 2..n (which still have df column names)
     for col in range(1, ncols + 1):
         cell = ws.cell(row=1, column=col)
         cell.font = Font(name="Calibri", bold=True, size=14, color=_WHITE)
@@ -450,10 +495,17 @@ def _write_assumptions(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                   "industry beta", "industry unlevered beta"}
     growth_keywords = ("year ", "growth")
 
+    # Labels that are assumptions (blue) vs facts/benchmarks (green)
+    assumption_params = {"risk-free rate", "equity risk premium", "country risk premium",
+                         "beta (levered)", "cost of equity", "cost of debt (pre-tax)",
+                         "wacc", "tax rate", "terminal growth", "projection years"}
+    benchmark_params = {"industry beta", "industry unlevered beta", "industry d/e", "industry wacc"}
+
     df = pd.DataFrame(rows, columns=["Parameter", "Value", "Source"])
     df.to_excel(writer, sheet_name="Assumptions", index=False)
 
     ws = _ws(writer, "Assumptions")
+    _hide_gridlines(ws)
     _style_header_row(ws, 1, 3)
 
     for row_idx in range(2, ws.max_row + 1):
@@ -465,9 +517,21 @@ def _write_assumptions(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
             continue
 
         ws.cell(row=row_idx, column=1).font = _NORMAL_FONT
+        label_lower = str(label).lower()
+
+        # Color coding
+        if label_lower in assumption_params:
+            val_cell.fill = _ASSUMPTION_FILL
+            source = ws.cell(row=row_idx, column=3).value
+            if source:
+                _add_comment(val_cell, f"Rationale: {source}")
+        elif label_lower in benchmark_params:
+            val_cell.fill = _FACT_FILL
+            _add_comment(val_cell, "Source: Damodaran data files")
+        elif label_lower.startswith("year ") and isinstance(val_cell.value, (int, float)):
+            val_cell.fill = _ASSUMPTION_FILL
 
         if isinstance(val_cell.value, (int, float)):
-            label_lower = str(label).lower()
             if label_lower in pct_params and abs(val_cell.value) <= 3:
                 val_cell.number_format = _FMT_PCT
             elif any(kw in label_lower for kw in growth_keywords) and abs(val_cell.value) <= 3:
@@ -481,7 +545,12 @@ def _write_assumptions(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 
 
 def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
-    """Sheet 3: DCF year-by-year projections — full Damodaran-style calculation flow."""
+    """Sheet 3: DCF year-by-year projections -- formula-based Damodaran-style.
+
+    Instead of hardcoding computed values, writes Excel formulas so the
+    spreadsheet is interactive. Assumptions are written to named cells and
+    projections reference them via formulas.
+    """
     if ctx.outputs.dcf_fcff:
         d = ctx.outputs.dcf_fcff
         a = ctx.assumptions
@@ -494,229 +563,13 @@ def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
         yearly_pv = d.get("yearly_pv", [])
         n = len(yearly_fcff)
 
-        # Detect v2 (revenue-based) vs v1 (ebit-based) by presence of yearly_revenue
+        # Detect v2 (revenue-based) vs v1 (ebit-based)
         is_v2 = bool(yearly_revenue)
 
         if is_v2:
-            # --- Reconstruct per-year schedules from output data ---
-            base_revenue = d.get("base_revenue")
-            base_ebit = d.get("base_ebit")
-
-            # Back-calculate base revenue from first projection year + growth rate
-            if base_revenue is None and yearly_revenue and a.growth_rates:
-                g0 = a.growth_rates[0]
-                base_revenue = yearly_revenue[0] / (1 + g0) if g0 != -1 else yearly_revenue[0]
-
-            # Revenue growth rates per year (derived from data)
-            rev_growth: list = []
-            for t in range(n):
-                prev = base_revenue if t == 0 else yearly_revenue[t - 1]
-                if prev and prev != 0:
-                    rev_growth.append(yearly_revenue[t] / prev - 1)
-                elif a.growth_rates and t < len(a.growth_rates):
-                    rev_growth.append(a.growth_rates[t])
-                else:
-                    rev_growth.append("")
-
-            # Operating margin per year: ebit / revenue
-            op_margins: list = []
-            for t in range(n):
-                rev = yearly_revenue[t] if t < len(yearly_revenue) else 0
-                ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
-                if rev and rev != 0:
-                    op_margins.append(ebt / rev)
-                else:
-                    op_margins.append("")
-
-            # Tax rate per year: 1 - ebit_at / ebit
-            tax_rates_y: list = []
-            for t in range(n):
-                ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
-                ebt_at = yearly_ebit_at[t] if t < len(yearly_ebit_at) else 0
-                if ebt and ebt != 0:
-                    tax_rates_y.append(1 - ebt_at / ebt)
-                else:
-                    tax_rates_y.append(a.tax_rate if a.tax_rate is not None else "")
-
-            # Cumulated discount factor: |fcff / pv|
-            cum_discount: list = []
-            for t in range(n):
-                fcff_t = yearly_fcff[t] if t < len(yearly_fcff) else 0
-                pv_t = yearly_pv[t] if t < len(yearly_pv) else 0
-                if fcff_t and fcff_t != 0 and pv_t and pv_t != 0:
-                    cum_discount.append(abs(fcff_t / pv_t))
-                else:
-                    cum_discount.append("")
-
-            # Per-year WACC: cum[t]/cum[t-1] - 1
-            wacc_y: list = []
-            for t in range(n):
-                cd = cum_discount[t]
-                if isinstance(cd, float):
-                    if t == 0:
-                        wacc_y.append(cd - 1)
-                    else:
-                        prev_cd = cum_discount[t - 1]
-                        if isinstance(prev_cd, float) and prev_cd != 0:
-                            wacc_y.append(cd / prev_cd - 1)
-                        else:
-                            wacc_y.append(a.wacc if a.wacc is not None else "")
-                else:
-                    wacc_y.append(a.wacc if a.wacc is not None else "")
-
-            # Terminal period values
-            terminal_growth = a.terminal_growth
-            terminal_margin = op_margins[-1] if op_margins and isinstance(op_margins[-1], float) else ""
-            terminal_tax = a.tax_rate if a.tax_rate is not None else (
-                tax_rates_y[-1] if tax_rates_y and isinstance(tax_rates_y[-1], float) else ""
-            )
-            base_margin = (base_ebit / base_revenue) if (base_ebit is not None and base_revenue) else ""
-            base_ebit_at = (base_ebit * (1 - a.tax_rate)) if (base_ebit is not None and a.tax_rate is not None) else ""
-
-            def _yr_vals(lst: list) -> list:
-                """Pad/trim list to exactly n elements as _safe values."""
-                return [_safe(lst[t]) if t < len(lst) else "" for t in range(n)]
-
-            def _make_row(label: str, base_val, yearly_vals: list, terminal_val="") -> list:
-                row = [label, _safe(base_val)] + _yr_vals(yearly_vals) + [_safe(terminal_val)]
-                return row
-
-            rows: list = []
-
-            # Year-label header row
-            rows.append([""] + ["Base"] + [str(t + 1) for t in range(n)] + ["Terminal"])
-
-            # REVENUE PROJECTIONS block
-            rows.append(["REVENUE PROJECTIONS"] + [""] * (n + 2))
-            rows.append(_make_row("Revenue Growth Rate", "", rev_growth, terminal_growth))
-            rows.append(_make_row("Revenues", base_revenue, yearly_revenue, ""))
-            rows.append(_make_row("Operating Margin", base_margin, op_margins, terminal_margin))
-            rows.append(_make_row("Operating Income (EBIT)", base_ebit, yearly_ebit, ""))
-
-            # TAX & REINVESTMENT block
-            rows.append([""] + [""] * (n + 2))
-            rows.append(["TAX & REINVESTMENT"] + [""] * (n + 2))
-            rows.append(_make_row("Tax Rate", a.tax_rate, tax_rates_y, terminal_tax))
-            rows.append(_make_row("EBIT(1-t)", base_ebit_at, yearly_ebit_at, ""))
-            rows.append(_make_row("- Reinvestment", "", yearly_reinvestment, ""))
-            rows.append(_make_row("= FCFF", "", yearly_fcff, _safe(d.get("terminal_fcff"))))
-
-            # DISCOUNT RATES block
-            rows.append([""] + [""] * (n + 2))
-            rows.append(["DISCOUNT RATES"] + [""] * (n + 2))
-            rows.append(_make_row("Cost of Capital (WACC)", a.wacc, wacc_y, ""))
-            rows.append(_make_row("Cumulated Discount Factor", "", cum_discount, ""))
-            rows.append(_make_row("PV(FCFF)", "", yearly_pv, ""))
-
-            # TERMINAL VALUE block
-            rows.append([""] + [""] * (n + 2))
-            rows.append(["TERMINAL VALUE"] + [""] * (n + 2))
-            # Terminal value and PV go in the Terminal column (last column)
-            rows.append(["Terminal Value"] + [""] * (n + 1) + [_safe(d.get("terminal_value"))])
-            rows.append(["PV(Terminal Value)"] + [""] * (n + 1) + [_safe(d.get("pv_terminal"))])
-
-            # EQUITY VALUE BRIDGE block
-            price = ctx.financials.key_stats.get("price")
-            shares = ctx.financials.key_stats.get("shares_outstanding")
-            vps = d.get("equity_value_per_share")
-            upside = (vps - price) / price if (vps and price and price > 0) else None
-
-            rows.append([""] + [""] * (n + 2))
-            rows.append(["EQUITY VALUE BRIDGE"] + [""] * (n + 2))
-            for label, val in [
-                ("Value of Operating Assets", d.get("enterprise_value")),
-                ("+ Cash", d.get("cash")),
-                ("- Debt", d.get("debt")),
-                ("+ Non-operating Assets", d.get("non_operating_assets")),
-                ("= Value of Equity", d.get("equity_value")),
-                ("/ Shares Outstanding", shares),
-                ("= Value per Share", vps),
-                ("Market Price", price),
-                ("% Under / Over Valued", upside),
-            ]:
-                rows.append([label, _safe(val)] + [""] * (n + 1))
-
+            _write_dcf_model_v2_formulas(writer, ctx, d, n)
         else:
-            # --- v1 fallback: EBIT-driven (no revenue data) ---
-            rows = [[""] + [str(t + 1) for t in range(n)] + ["Terminal"]]
-            rows.append(["EBIT(1-t)"] + [_safe(v) for v in yearly_ebit_at] + [""])
-            rows.append(["FCFF"] + [_safe(v) for v in yearly_fcff] + [_safe(d.get("terminal_value"))])
-            rows.append(["PV of FCFF"] + [_safe(v) for v in yearly_pv] + [_safe(d.get("pv_terminal"))])
-            rows.append([""] * (n + 2))
-            rows.append(["PV of High-Growth Phase", _safe(d.get("pv_high_growth"))] + [""] * (n + 1))
-            rows.append(["PV of Terminal Value", _safe(d.get("pv_terminal"))] + [""] * (n + 1))
-            rows.append(["Enterprise Value", _safe(d.get("enterprise_value"))] + [""] * (n + 1))
-            rows.append(["Equity Value", _safe(d.get("equity_value"))] + [""] * (n + 1))
-            rows.append(["Value per Share", _safe(d.get("equity_value_per_share"))] + [""] * (n + 1))
-
-        max_cols = max(len(r) for r in rows)
-        for r in rows:
-            while len(r) < max_cols:
-                r.append("")
-
-        df = pd.DataFrame(rows)
-        df.to_excel(writer, sheet_name="DCF Model", index=False, header=False)
-
-        ws = _ws(writer, "DCF Model")
-
-        _pct_labels_dcf = {
-            "revenue growth rate", "operating margin", "tax rate",
-            "cost of capital (wacc)",
-        }
-        _price_labels_dcf = {"= value per share", "market price"}
-        _factor_labels_dcf = {"cumulated discount factor"}
-        _section_labels_dcf = {
-            "revenue projections", "tax & reinvestment",
-            "discount rates", "terminal value", "equity value bridge",
-        }
-
-        for row_idx in range(1, ws.max_row + 1):
-            label_cell = ws.cell(row=row_idx, column=1)
-            label_raw = label_cell.value or ""
-            label_lower = str(label_raw).strip().lower()
-
-            # Year-label header row (row 1)
-            if row_idx == 1:
-                _style_header_row(ws, row_idx, max_cols)
-                continue
-
-            # Blank separator rows
-            if label_lower == "":
-                continue
-
-            # Section title rows
-            if label_lower in _section_labels_dcf:
-                _style_section_title(ws, row_idx, max_cols)
-                continue
-
-            label_cell.font = _BOLD_FONT
-            label_cell.alignment = _LEFT
-
-            for col_idx in range(2, max_cols + 1):
-                cell = ws.cell(row=row_idx, column=col_idx)
-                val = cell.value
-                if not isinstance(val, (int, float)):
-                    continue
-
-                if label_lower in _pct_labels_dcf and abs(val) <= 3:
-                    cell.number_format = _FMT_PCT
-                elif label_lower in _price_labels_dcf:
-                    cell.number_format = _FMT_PRICE
-                elif label_lower in _factor_labels_dcf:
-                    cell.number_format = "#,##0.000"
-                elif label_lower == "% under / over valued":
-                    cell.number_format = _FMT_PCT
-                    _apply_upside_color(cell)
-                else:
-                    cell.number_format = _FMT_INT
-                cell.alignment = _RIGHT
-
-        # Column widths
-        ws.column_dimensions["A"].width = 30
-        for col_idx in range(2, max_cols + 1):
-            ws.column_dimensions[get_column_letter(col_idx)].width = 15
-
-        ws.freeze_panes = "B2"
+            _write_dcf_model_v1(writer, ctx, d, n)
 
     elif ctx.outputs.dcf_fcfe:
         d = ctx.outputs.dcf_fcfe
@@ -738,6 +591,7 @@ def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
         df.to_excel(writer, sheet_name="DCF Model (DDM)", index=False)
 
         ws = _ws(writer, "DCF Model (DDM)")
+        _hide_gridlines(ws)
         _style_header_row(ws, 1, 4)
 
         for row_idx in range(2, ws.max_row + 1):
@@ -753,6 +607,640 @@ def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 
         _autofit_columns(ws, min_label_width=20)
         _freeze_top_row(ws)
+
+
+def _write_dcf_model_v2_formulas(
+    writer: pd.ExcelWriter, ctx: ValuationContext, d: dict, n: int
+) -> None:
+    """Write the DCF Model sheet using Excel formulas (revenue-based / v2).
+
+    Layout:
+      Col A: Labels
+      Col B: Base year
+      Col C..C+n-1: Year 1..n
+      Col C+n: Terminal year
+    """
+    a = ctx.assumptions
+    yearly_revenue = d.get("yearly_revenue", [])
+    yearly_ebit = d.get("yearly_ebit", [])
+    yearly_ebit_at = d.get("yearly_ebit_at", [])
+    yearly_reinvestment = d.get("yearly_reinvestment", [])
+    yearly_fcff = d.get("yearly_fcff", [])
+    yearly_pv = d.get("yearly_pv", [])
+
+    base_revenue = d.get("base_revenue")
+    base_ebit = d.get("base_ebit")
+
+    # Back-calculate base revenue from first projection year + growth rate
+    if base_revenue is None and yearly_revenue and a.growth_rates:
+        g0 = a.growth_rates[0]
+        base_revenue = yearly_revenue[0] / (1 + g0) if g0 != -1 else yearly_revenue[0]
+
+    # Compute per-year growth rates from data
+    rev_growth: list = []
+    for t in range(n):
+        prev = base_revenue if t == 0 else yearly_revenue[t - 1]
+        if prev and prev != 0:
+            rev_growth.append(yearly_revenue[t] / prev - 1)
+        elif a.growth_rates and t < len(a.growth_rates):
+            rev_growth.append(a.growth_rates[t])
+        else:
+            rev_growth.append(0)
+
+    # Operating margin per year
+    op_margins: list = []
+    for t in range(n):
+        rev = yearly_revenue[t] if t < len(yearly_revenue) else 0
+        ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
+        if rev and rev != 0:
+            op_margins.append(ebt / rev)
+        else:
+            op_margins.append(0)
+
+    # Tax rate per year
+    tax_rates_y: list = []
+    for t in range(n):
+        ebt = yearly_ebit[t] if t < len(yearly_ebit) else 0
+        ebt_at = yearly_ebit_at[t] if t < len(yearly_ebit_at) else 0
+        if ebt and ebt != 0:
+            tax_rates_y.append(1 - ebt_at / ebt)
+        else:
+            tax_rates_y.append(a.tax_rate if a.tax_rate is not None else 0)
+
+    # Sales-to-capital ratio (S2C) for reinvestment: delta_rev / reinvestment
+    s2c_values: list = []
+    for t in range(n):
+        reinv = yearly_reinvestment[t] if t < len(yearly_reinvestment) else 0
+        prev_rev = base_revenue if t == 0 else yearly_revenue[t - 1]
+        curr_rev = yearly_revenue[t] if t < len(yearly_revenue) else 0
+        delta_rev = curr_rev - prev_rev if prev_rev else 0
+        if reinv and reinv != 0:
+            s2c_values.append(delta_rev / reinv)
+        else:
+            s2c_values.append(2.0)  # default S2C
+
+    # Cumulated discount factor
+    cum_discount: list = []
+    for t in range(n):
+        fcff_t = yearly_fcff[t] if t < len(yearly_fcff) else 0
+        pv_t = yearly_pv[t] if t < len(yearly_pv) else 0
+        if fcff_t and fcff_t != 0 and pv_t and pv_t != 0:
+            cum_discount.append(abs(fcff_t / pv_t))
+        else:
+            cum_discount.append(1.0)
+
+    # Per-year WACC from cum_discount
+    wacc_y: list = []
+    for t in range(n):
+        cd = cum_discount[t]
+        if t == 0:
+            wacc_y.append(cd - 1)
+        else:
+            prev_cd = cum_discount[t - 1]
+            if prev_cd and prev_cd != 0:
+                wacc_y.append(cd / prev_cd - 1)
+            else:
+                wacc_y.append(a.wacc if a.wacc is not None else 0)
+
+    # Terminal period values
+    terminal_growth = a.terminal_growth if a.terminal_growth is not None else 0
+    terminal_margin = op_margins[-1] if op_margins else 0
+    terminal_tax = a.tax_rate if a.tax_rate is not None else (
+        tax_rates_y[-1] if tax_rates_y else 0
+    )
+    base_margin = (base_ebit / base_revenue) if (base_ebit is not None and base_revenue) else 0
+    base_ebit_at = (base_ebit * (1 - a.tax_rate)) if (base_ebit is not None and a.tax_rate is not None) else 0
+
+    # --- Write to worksheet using openpyxl directly ---
+    # Create empty sheet via pandas, then overwrite with formulas
+    empty_df = pd.DataFrame([[""] * (n + 3)])
+    empty_df.to_excel(writer, sheet_name="DCF Model", index=False, header=False)
+    ws = _ws(writer, "DCF Model")
+    _hide_gridlines(ws)
+
+    # Column layout: A=labels, B=Base, C=Year1, D=Year2, ... C+n-1=YearN, C+n=Terminal
+    max_cols = n + 3  # A + Base + n years + Terminal
+    term_col = n + 3  # terminal column number (1-indexed)
+
+    # Helper to get column letter by 1-indexed position
+    def col_let(c: int) -> str:
+        return get_column_letter(c)
+
+    # --- Row 1: Header row ---
+    row = 1
+    ws.cell(row=row, column=1, value="")
+    ws.cell(row=row, column=2, value="Base")
+    for t in range(n):
+        ws.cell(row=row, column=t + 3, value=f"Year {t+1}")
+    ws.cell(row=row, column=term_col, value="Terminal")
+    _style_header_row(ws, row, max_cols)
+
+    # --- Row 2: Section: REVENUE PROJECTIONS ---
+    row = 2
+    ws.cell(row=row, column=1, value="REVENUE PROJECTIONS")
+    _style_section_title(ws, row, max_cols)
+
+    # --- Row 3: Revenue Growth Rate [blue = assumption] ---
+    row = 3
+    ws.cell(row=row, column=1, value="Revenue Growth Rate")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    ws.cell(row=row, column=2, value="")  # no growth for base
+    for t in range(n):
+        c = t + 3
+        cell = ws.cell(row=row, column=c, value=rev_growth[t])
+        cell.number_format = _FMT_PCT
+        cell.alignment = _RIGHT
+        cell.fill = _ASSUMPTION_FILL
+        _add_comment(cell, "Assumption: interpolated growth schedule")
+    # Terminal growth
+    cell = ws.cell(row=row, column=term_col, value=terminal_growth)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    _add_comment(cell, "Assumption: nominal GDP growth rate")
+
+    # --- Row 4: Revenues [base=green/fact, projections=formula] ---
+    row = 4
+    ws.cell(row=row, column=1, value="Revenues")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    # Base revenue (fact)
+    cell = ws.cell(row=row, column=2, value=base_revenue)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    _add_comment(cell, "Source: Yahoo Finance (TTM or latest annual)")
+    # Year 1..n: formula = PrevRevenue * (1 + GrowthRate)
+    for t in range(n):
+        c = t + 3
+        prev_col = col_let(c - 1)
+        growth_col = col_let(c)
+        # Formula: =<prev_col>4 * (1 + <growth_col>3)
+        formula = f"={prev_col}4*(1+{growth_col}3)"
+        cell = ws.cell(row=row, column=c, value=formula)
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+        # No fill = calculation
+
+    # --- Row 5: Operating Margin [blue = assumption] ---
+    row = 5
+    ws.cell(row=row, column=1, value="Operating Margin")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    # Base margin
+    cell = ws.cell(row=row, column=2, value=base_margin if base_margin else "")
+    if isinstance(base_margin, (int, float)):
+        cell.number_format = _FMT_PCT
+        cell.alignment = _RIGHT
+        cell.fill = _FACT_FILL
+        _add_comment(cell, "Source: computed from financials (EBIT/Revenue)")
+    # Year margins
+    for t in range(n):
+        c = t + 3
+        cell = ws.cell(row=row, column=c, value=op_margins[t])
+        cell.number_format = _FMT_PCT
+        cell.alignment = _RIGHT
+        cell.fill = _ASSUMPTION_FILL
+        _add_comment(cell, "Assumption: margin convergence schedule")
+    # Terminal margin
+    cell = ws.cell(row=row, column=term_col, value=terminal_margin)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+
+    # --- Row 6: Operating Income (EBIT) [formula = Revenue * Margin] ---
+    row = 6
+    ws.cell(row=row, column=1, value="Operating Income (EBIT)")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    # Base EBIT (fact)
+    cell = ws.cell(row=row, column=2, value=base_ebit)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    _add_comment(cell, "Source: Yahoo Finance")
+    # Year 1..n: formula = Revenue * Margin
+    for t in range(n):
+        c = t + 3
+        cl = col_let(c)
+        formula = f"={cl}4*{cl}5"
+        cell = ws.cell(row=row, column=c, value=formula)
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+
+    # --- Row 7: blank ---
+    row = 7
+
+    # --- Row 8: Section: TAX & REINVESTMENT ---
+    row = 8
+    ws.cell(row=row, column=1, value="TAX & REINVESTMENT")
+    _style_section_title(ws, row, max_cols)
+
+    # --- Row 9: Tax Rate [blue/gray] ---
+    row = 9
+    ws.cell(row=row, column=1, value="Tax Rate")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    cell = ws.cell(row=row, column=2, value=a.tax_rate)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    _add_comment(cell, "Assumption: effective tax rate from financials")
+    for t in range(n):
+        c = t + 3
+        cell = ws.cell(row=row, column=c, value=tax_rates_y[t])
+        cell.number_format = _FMT_PCT
+        cell.alignment = _RIGHT
+        cell.fill = _ASSUMPTION_FILL
+    cell = ws.cell(row=row, column=term_col, value=terminal_tax)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+
+    # --- Row 10: EBIT(1-t) [formula = EBIT * (1 - TaxRate)] ---
+    row = 10
+    ws.cell(row=row, column=1, value="EBIT(1-t)")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    # Base
+    if base_ebit_at:
+        cell = ws.cell(row=row, column=2, value=f"=B6*(1-B9)")
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+    # Years
+    for t in range(n):
+        c = t + 3
+        cl = col_let(c)
+        formula = f"={cl}6*(1-{cl}9)"
+        cell = ws.cell(row=row, column=c, value=formula)
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+
+    # --- Row 11: Sales to Capital Ratio (S2C) [gray = hardcoded from heuristic] ---
+    row = 11
+    ws.cell(row=row, column=1, value="Sales to Capital Ratio")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        c = t + 3
+        cell = ws.cell(row=row, column=c, value=s2c_values[t])
+        cell.number_format = _FMT_DEC
+        cell.alignment = _RIGHT
+        cell.fill = _HARDCODED_FILL
+        _add_comment(cell, "Hardcoded: computed from delta_revenue / reinvestment")
+
+    # --- Row 12: Reinvestment [formula = (Revenue - PrevRevenue) / S2C] ---
+    row = 12
+    ws.cell(row=row, column=1, value="Reinvestment")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        c = t + 3
+        cl = col_let(c)
+        prev_cl = col_let(c - 1)
+        # Formula: =(Revenue_this - Revenue_prev) / S2C
+        formula = f"=({cl}4-{prev_cl}4)/{cl}11"
+        cell = ws.cell(row=row, column=c, value=formula)
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+
+    # --- Row 13: FCFF [formula = EBIT(1-t) - Reinvestment] ---
+    row = 13
+    ws.cell(row=row, column=1, value="Free Cash Flow to Firm")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        c = t + 3
+        cl = col_let(c)
+        formula = f"={cl}10-{cl}12"
+        cell = ws.cell(row=row, column=c, value=formula)
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+    # Terminal FCFF (hardcoded since it requires stable ROC logic)
+    terminal_fcff = d.get("terminal_fcff")
+    if terminal_fcff:
+        cell = ws.cell(row=row, column=term_col, value=terminal_fcff)
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+        cell.fill = _HARDCODED_FILL
+        _add_comment(cell, "Hardcoded: Terminal FCFF = EBIT(1-t) * (1 - g/ROC)")
+
+    # --- Row 14: blank ---
+    row = 14
+
+    # --- Row 15: Section: DISCOUNT RATES ---
+    row = 15
+    ws.cell(row=row, column=1, value="DISCOUNT RATES")
+    _style_section_title(ws, row, max_cols)
+
+    # --- Row 16: Cost of Capital (WACC) [gray = from schedule] ---
+    row = 16
+    ws.cell(row=row, column=1, value="Cost of Capital (WACC)")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        c = t + 3
+        cell = ws.cell(row=row, column=c, value=wacc_y[t])
+        cell.number_format = _FMT_PCT
+        cell.alignment = _RIGHT
+        cell.fill = _HARDCODED_FILL
+        _add_comment(cell, "Hardcoded: from WACC transition schedule (Python)")
+    # Terminal WACC
+    terminal_wacc = wacc_y[-1] if wacc_y else (a.wacc or 0)
+    cell = ws.cell(row=row, column=term_col, value=terminal_wacc)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _HARDCODED_FILL
+    _add_comment(cell, "Hardcoded: stable-state WACC")
+
+    # --- Row 17: Cumulated Discount Factor [formula = prev * (1+WACC)] ---
+    row = 17
+    ws.cell(row=row, column=1, value="Cumulated Discount Factor")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        c = t + 3
+        cl = col_let(c)
+        if t == 0:
+            # First year: = 1 + WACC
+            formula = f"=1+{cl}16"
+        else:
+            prev_cl = col_let(c - 1)
+            formula = f"={prev_cl}17*(1+{cl}16)"
+        cell = ws.cell(row=row, column=c, value=formula)
+        cell.number_format = "#,##0.0000"
+        cell.alignment = _RIGHT
+
+    # --- Row 18: PV(FCFF) [formula = FCFF / CumulatedDiscount] ---
+    row = 18
+    ws.cell(row=row, column=1, value="PV(FCFF)")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        c = t + 3
+        cl = col_let(c)
+        formula = f"={cl}13/{cl}17"
+        cell = ws.cell(row=row, column=c, value=formula)
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+
+    # --- Row 19: blank ---
+    row = 19
+
+    # --- Row 20: Section: TERMINAL VALUE ---
+    row = 20
+    ws.cell(row=row, column=1, value="TERMINAL VALUE")
+    _style_section_title(ws, row, max_cols)
+
+    # --- Row 21: Terminal Value [formula or hardcoded] ---
+    row = 21
+    ws.cell(row=row, column=1, value="Terminal Value")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    # Terminal Value = Terminal FCFF / (Terminal WACC - Terminal Growth)
+    # We write a formula referencing the terminal column cells
+    term_cl = col_let(term_col)
+    last_year_cl = col_let(term_col - 1)
+    # Terminal FCFF is in row 13, terminal col; WACC in row 16 term col; growth in row 3 term col
+    formula = f"={term_cl}13/({term_cl}16-{term_cl}3)"
+    cell = ws.cell(row=row, column=term_col, value=formula)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+
+    # --- Row 22: PV(Terminal Value) [formula = TV / CumDiscount_last_year] ---
+    row = 22
+    ws.cell(row=row, column=1, value="PV(Terminal Value)")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    # PV of TV = TV / last year's cumulated discount
+    formula = f"={term_cl}21/{last_year_cl}17"
+    cell = ws.cell(row=row, column=term_col, value=formula)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+
+    # --- Row 23: blank ---
+    row = 23
+
+    # --- Row 24: Section: EQUITY VALUE BRIDGE ---
+    row = 24
+    ws.cell(row=row, column=1, value="EQUITY VALUE BRIDGE")
+    _style_section_title(ws, row, max_cols)
+
+    # For the equity bridge, we use formulas where possible
+    # Sum of PV(FCFF) across all years + PV(Terminal)
+    price = ctx.financials.key_stats.get("price")
+    shares = ctx.financials.key_stats.get("shares_outstanding")
+    cash = d.get("cash", 0) or 0
+    debt = d.get("debt", 0) or 0
+    non_op = d.get("non_operating_assets", 0) or 0
+
+    # --- Row 25: PV of Operating Cash Flows (sum of PV row) ---
+    row = 25
+    ws.cell(row=row, column=1, value="PV of Cash Flows (High Growth)")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    # Formula: =SUM(C18:XX18) where XX is the last year column
+    first_year_cl = col_let(3)
+    last_data_cl = col_let(n + 2)
+    formula = f"=SUM({first_year_cl}18:{last_data_cl}18)"
+    cell = ws.cell(row=row, column=2, value=formula)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+
+    # --- Row 26: PV of Terminal Value ---
+    row = 26
+    ws.cell(row=row, column=1, value="PV of Terminal Value")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    formula = f"={term_cl}22"
+    cell = ws.cell(row=row, column=2, value=formula)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+
+    # --- Row 27: Value of Operating Assets = sum ---
+    row = 27
+    ws.cell(row=row, column=1, value="Value of Operating Assets")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    formula = "=B25+B26"
+    cell = ws.cell(row=row, column=2, value=formula)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+
+    # --- Row 28: + Cash [green = fact] ---
+    row = 28
+    ws.cell(row=row, column=1, value="Add: Cash & Marketable Securities")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    cell = ws.cell(row=row, column=2, value=cash)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    _add_comment(cell, "Source: Yahoo Finance (Balance Sheet)")
+
+    # --- Row 29: - Debt [green = fact] ---
+    row = 29
+    ws.cell(row=row, column=1, value="Less: Debt")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    cell = ws.cell(row=row, column=2, value=debt)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    _add_comment(cell, "Source: Yahoo Finance (Balance Sheet)")
+
+    # --- Row 30: + Non-operating Assets ---
+    row = 30
+    ws.cell(row=row, column=1, value="Add: Non-operating Assets")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    cell = ws.cell(row=row, column=2, value=non_op)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    if non_op:
+        cell.fill = _HARDCODED_FILL
+        _add_comment(cell, "Hardcoded: cross-holdings or other non-operating assets")
+
+    # --- Row 31: = Value of Equity [formula] ---
+    row = 31
+    ws.cell(row=row, column=1, value="Value of Equity")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    formula = "=B27+B28-B29+B30"
+    cell = ws.cell(row=row, column=2, value=formula)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+
+    # --- Row 32: / Shares Outstanding [green = fact] ---
+    row = 32
+    ws.cell(row=row, column=1, value="Shares Outstanding")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    cell = ws.cell(row=row, column=2, value=shares)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    _add_comment(cell, "Source: Yahoo Finance")
+
+    # --- Row 33: = Value per Share [formula] ---
+    row = 33
+    ws.cell(row=row, column=1, value="Value per Share")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    formula = "=B31/B32"
+    cell = ws.cell(row=row, column=2, value=formula)
+    cell.number_format = _FMT_PRICE
+    cell.alignment = _RIGHT
+
+    # --- Row 34: Market Price [green = fact] ---
+    row = 34
+    ws.cell(row=row, column=1, value="Market Price")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    cell = ws.cell(row=row, column=2, value=price)
+    cell.number_format = _FMT_PRICE
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    _add_comment(cell, "Source: Yahoo Finance (current market price)")
+
+    # --- Row 35: % Under/Over Valued [formula] ---
+    row = 35
+    ws.cell(row=row, column=1, value="Implied Upside/Downside")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    formula = "=(B33-B34)/B34"
+    cell = ws.cell(row=row, column=2, value=formula)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+
+    # --- Column widths ---
+    ws.column_dimensions["A"].width = 30
+    for col_idx in range(2, max_cols + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 15
+
+    ws.freeze_panes = "B2"
+
+
+def _write_dcf_model_v1(
+    writer: pd.ExcelWriter, ctx: ValuationContext, d: dict, n: int
+) -> None:
+    """Write v1 EBIT-driven DCF model (no revenue data) -- also formula-based where possible."""
+    a = ctx.assumptions
+    yearly_ebit_at = d.get("yearly_ebit_at", [])
+    yearly_fcff = d.get("yearly_fcff", [])
+    yearly_pv = d.get("yearly_pv", [])
+
+    # Create empty sheet
+    empty_df = pd.DataFrame([[""] * (n + 3)])
+    empty_df.to_excel(writer, sheet_name="DCF Model", index=False, header=False)
+    ws = _ws(writer, "DCF Model")
+    _hide_gridlines(ws)
+
+    max_cols = n + 2  # A + n years + Terminal
+    term_col = n + 2
+
+    # Row 1: Header
+    row = 1
+    ws.cell(row=row, column=1, value="")
+    for t in range(n):
+        ws.cell(row=row, column=t + 2, value=f"Year {t+1}")
+    ws.cell(row=row, column=term_col, value="Terminal")
+    _style_header_row(ws, row, max_cols)
+
+    # Row 2: EBIT(1-t) values [hardcoded since no base to formula from]
+    row = 2
+    ws.cell(row=row, column=1, value="EBIT(1-t)")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        cell = ws.cell(row=row, column=t + 2, value=_safe(yearly_ebit_at[t] if t < len(yearly_ebit_at) else ""))
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = _FMT_INT
+            cell.alignment = _RIGHT
+            cell.fill = _HARDCODED_FILL
+            _add_comment(cell, "Hardcoded: projected from growth schedule")
+
+    # Row 3: FCFF
+    row = 3
+    ws.cell(row=row, column=1, value="Free Cash Flow to Firm")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        cell = ws.cell(row=row, column=t + 2, value=_safe(yearly_fcff[t] if t < len(yearly_fcff) else ""))
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = _FMT_INT
+            cell.alignment = _RIGHT
+            cell.fill = _HARDCODED_FILL
+    cell = ws.cell(row=row, column=term_col, value=_safe(d.get("terminal_value")))
+    if isinstance(cell.value, (int, float)):
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+
+    # Row 4: PV of FCFF
+    row = 4
+    ws.cell(row=row, column=1, value="PV of FCFF")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    for t in range(n):
+        cell = ws.cell(row=row, column=t + 2, value=_safe(yearly_pv[t] if t < len(yearly_pv) else ""))
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = _FMT_INT
+            cell.alignment = _RIGHT
+    cell = ws.cell(row=row, column=term_col, value=_safe(d.get("pv_terminal")))
+    if isinstance(cell.value, (int, float)):
+        cell.number_format = _FMT_INT
+        cell.alignment = _RIGHT
+
+    # Row 5: blank
+    row = 6
+    ws.cell(row=row, column=1, value="PV of High-Growth Phase")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    ws.cell(row=row, column=2, value=_safe(d.get("pv_high_growth")))
+
+    row = 7
+    ws.cell(row=row, column=1, value="PV of Terminal Value")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    ws.cell(row=row, column=2, value=_safe(d.get("pv_terminal")))
+
+    row = 8
+    ws.cell(row=row, column=1, value="Enterprise Value")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    ws.cell(row=row, column=2, value=_safe(d.get("enterprise_value")))
+
+    row = 9
+    ws.cell(row=row, column=1, value="Equity Value")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    ws.cell(row=row, column=2, value=_safe(d.get("equity_value")))
+
+    row = 10
+    ws.cell(row=row, column=1, value="Value per Share")
+    ws.cell(row=row, column=1).font = _BOLD_FONT
+    ws.cell(row=row, column=2, value=_safe(d.get("equity_value_per_share")))
+
+    for r in range(6, 11):
+        cell = ws.cell(row=r, column=2)
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = _FMT_INT
+            cell.alignment = _RIGHT
+
+    ws.column_dimensions["A"].width = 30
+    for col_idx in range(2, max_cols + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 15
+
+    ws.freeze_panes = "B2"
 
 
 def _write_relative_valuation(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
@@ -791,6 +1279,7 @@ def _write_relative_valuation(writer: pd.ExcelWriter, ctx: ValuationContext) -> 
     df.to_excel(writer, sheet_name="Relative Valuation", index=False)
 
     ws = _ws(writer, "Relative Valuation")
+    _hide_gridlines(ws)
     _style_header_row(ws, 1, 3)
 
     for row_idx in range(2, ws.max_row + 1):
@@ -892,6 +1381,7 @@ def _write_peer_comparison(writer: pd.ExcelWriter, ctx: ValuationContext) -> Non
     df.to_excel(writer, sheet_name="Peer Comparison", index=False)
 
     ws = _ws(writer, "Peer Comparison")
+    _hide_gridlines(ws)
     _style_header_row(ws, 1, n_cols)
 
     for row_idx in range(2, ws.max_row + 1):
@@ -915,40 +1405,32 @@ def _write_peer_comparison(writer: pd.ExcelWriter, ctx: ValuationContext) -> Non
 
 
 def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
-    """Sheet 5: Sensitivity tables — formatted as proper grids with WACC vs terminal growth."""
+    """Sheet 5: Sensitivity tables -- formatted as proper grids with WACC vs terminal growth."""
     if not ctx.outputs.sensitivity:
         return
 
     sens = ctx.outputs.sensitivity
 
-    # Detect if there are two-way tables present
-    has_two_way = any(
-        isinstance(v, dict) and isinstance(next(iter(v.values()), None), dict)
-        for v in sens.values()
-        if isinstance(v, dict)
-    )
-
-    # Build base case value for highlighting (look for dcf value)
+    # Build base case value for highlighting
     base_case_val = None
     if ctx.outputs.dcf_fcff:
         base_case_val = ctx.outputs.dcf_fcff.get("equity_value_per_share")
     elif ctx.outputs.dcf_fcfe:
         base_case_val = ctx.outputs.dcf_fcfe.get("value_per_share")
 
-    # Determine base WACC and terminal growth for highlight
     base_wacc = ctx.assumptions.wacc
     base_tg = ctx.assumptions.terminal_growth
 
     all_rows = []
-    table_positions: list[dict] = []  # track where two-way tables start for formatting
+    table_positions: list[dict] = []
 
-    current_excel_row = 1  # 1-indexed, accounts for header=False
+    current_excel_row = 1
 
     for table_name, table_data in sens.items():
         if isinstance(table_data, dict):
             first_val = next(iter(table_data.values()), None)
             if isinstance(first_val, dict):
-                # Two-way table: rows = param1 values, cols = param2 values
+                # Two-way table
                 col_keys = sorted(first_val.keys())
                 header = [table_name] + [
                     f"{c:.4f}" if isinstance(c, float) else str(c) for c in col_keys
@@ -1001,20 +1483,19 @@ def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
     df.to_excel(writer, sheet_name="Sensitivity", index=False, header=False)
 
     ws = _ws(writer, "Sensitivity")
+    _hide_gridlines(ws)
 
     # Style two-way tables
     for tbl in table_positions:
         hrow = tbl["header_row"]
         ncols = tbl["n_cols"]
 
-        # Style the table header row
         _style_section_title(ws, hrow, ncols)
         ws.cell(row=hrow, column=1).font = Font(name="Calibri", bold=True, size=11)
 
         col_keys = tbl["col_keys"]
         row_keys = tbl["row_keys"]
 
-        # Style column label cells (row header row = first data row's row_key labels)
         for ci, ck in enumerate(col_keys, start=2):
             cell = ws.cell(row=hrow, column=ci)
             cell.font = _BOLD_FONT
@@ -1025,7 +1506,6 @@ def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 
         for ri, rk in enumerate(row_keys):
             excel_row = tbl["data_start_row"] + ri
-            # Row label
             lbl_cell = ws.cell(row=excel_row, column=1)
             lbl_cell.font = _BOLD_FONT
             if isinstance(rk, float):
@@ -1044,7 +1524,6 @@ def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                     cell.number_format = _FMT_PRICE
                     cell.alignment = _RIGHT
 
-                    # Highlight base-case cell
                     is_base_row = (
                         base_wacc is not None
                         and isinstance(rk, float)
@@ -1059,7 +1538,6 @@ def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                         cell.fill = PatternFill("solid", fgColor=_YELLOW_BG)
                         cell.font = Font(name="Calibri", bold=True, size=10)
                     elif base_case_val is not None:
-                        # Conditional coloring: green if above base, red if below
                         if fval > base_case_val * 1.05:
                             cell.fill = PatternFill("solid", fgColor="C6EFCE")
                         elif fval < base_case_val * 0.95:
@@ -1067,7 +1545,7 @@ def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                 except (ValueError, TypeError):
                     pass
 
-    # Style one-way table headers (rows not covered by table_positions)
+    # Style one-way table headers
     covered_rows = set()
     for tbl in table_positions:
         covered_rows.update(range(tbl["header_row"], tbl["data_end_row"] + 1))
@@ -1084,13 +1562,13 @@ def _write_sensitivity(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                 ws.cell(row=row_idx, column=2).font = _BOLD_FONT
 
     _autofit_columns(ws)
-    ws.freeze_panes = None  # Sensitivity tables don't need freeze
+    ws.freeze_panes = None
 
 
 def _write_analyst_consensus(
     writer: pd.ExcelWriter, ctx: ValuationContext, ibes_data: dict | None
 ) -> None:
-    """Sheet 6: Analyst consensus comparison — Yahoo Finance + I/B/E/S."""
+    """Sheet 6: Analyst consensus comparison -- Yahoo Finance + I/B/E/S."""
     analyst_data = ctx.financials.key_stats.get("analyst_data") or {}
     price = ctx.financials.key_stats.get("price")
     pt = analyst_data.get("price_targets") or {}
@@ -1099,19 +1577,19 @@ def _write_analyst_consensus(
 
     rows = [
         ["ANALYST CONSENSUS vs OUR ESTIMATE", "", "", ""],
-        ["(Consensus is for COMPARISON ONLY — not used as DCF input)", "", "", ""],
+        ["(Consensus is for COMPARISON ONLY \u2014 not used as DCF input)", "", "", ""],
         ["", "", "", ""],
     ]
 
     # --- Price Targets ---
     if pt:
-        rows.append(["PRICE TARGETS (Yahoo Finance)", "", "", ""])
+        rows.append(["PRICE TARGETS (YAHOO FINANCE)", "", "", ""])
         rows.append(["Mean Target", _safe(pt.get("targetMean")), "", ""])
         rows.append(["Median Target", _safe(pt.get("targetMedian")), "", ""])
         rows.append(["High Target", _safe(pt.get("targetHigh")), "", ""])
         rows.append(["Low Target", _safe(pt.get("targetLow")), "", ""])
         if pt.get("numberOfAnalysts"):
-            rows.append(["# Analysts", pt["numberOfAnalysts"], "", ""])
+            rows.append(["Number of Analysts", pt["numberOfAnalysts"], "", ""])
         rows.append(["", "", "", ""])
 
     # --- Analyst Recommendations ---
@@ -1129,7 +1607,7 @@ def _write_analyst_consensus(
         total = sum(total_latest.get(k, 0) for k in ("strongBuy", "buy", "hold", "sell", "strongSell"))
         if total > 0:
             buy_pct = (total_latest.get("strongBuy", 0) + total_latest.get("buy", 0)) / total
-            rows.append(["% Buy/Strong Buy", buy_pct, "", f"of {total} analysts"])
+            rows.append(["Pct Buy/Strong Buy", buy_pct, "", f"of {total} analysts"])
         rows.append(["", "", "", ""])
 
     # --- Earnings Estimates ---
@@ -1150,7 +1628,7 @@ def _write_analyst_consensus(
                     _safe(high.get(period)),
                 ])
         rows.append(["", "", "", ""])
-        rows.append(["CONSENSUS GROWTH ESTIMATES", "Growth Rate", "# Analysts", ""])
+        rows.append(["CONSENSUS GROWTH ESTIMATES", "Growth Rate", "Num Analysts", ""])
         for period, label in [("0q", "Current Qtr"), ("+1q", "Next Qtr"),
                                ("0y", "Current Year"), ("+1y", "Next Year")]:
             if period in growth:
@@ -1162,7 +1640,7 @@ def _write_analyst_consensus(
         est = ibes_data["estimates"]
         if est is not None and not est.empty:
             rows.append(["I/B/E/S CONSENSUS (WRDS)", "", "", ""])
-            rows.append(["Period", "Mean EPS", "Median EPS", "# Analysts"])
+            rows.append(["Period", "Mean EPS", "Median EPS", "Num Analysts"])
             for _, row in est.head(6).iterrows():
                 rows.append([
                     str(row.get("statpers", "")),
@@ -1175,9 +1653,8 @@ def _write_analyst_consensus(
     # --- Top Analysts (accuracy-ranked) ---
     top_analysts = ibes_data.get("top_analysts") if ibes_data else None
     if top_analysts is not None and not top_analysts.empty:
-        rows.append(["TOP ANALYSTS (Ranked by EPS Forecast Accuracy)", "", "", ""])
-        rows.append(["Analyst", "Firm", "Accuracy", "Target", "Recommendation", "# Estimates"])
-        # Extend to 6 columns — pad existing rows below
+        rows.append(["TOP ANALYSTS (RANKED BY EPS FORECAST ACCURACY)", "", "", ""])
+        rows.append(["Analyst", "Firm", "Accuracy", "Target", "Recommendation", "Num Estimates"])
         for _, row in top_analysts.iterrows():
             analyst_name = str(row.get("analyst_name") or "N/A")
             firm = str(row.get("firm") or "N/A")
@@ -1224,7 +1701,7 @@ def _write_analyst_consensus(
             if our_dcf < pt["targetMean"]:
                 rows.append(["Our DCF is BELOW analyst targets", "", "", ""])
                 rows.append(["Possible reasons:", "", "", ""])
-                rows.append(["  1. We use fundamental growth (ROE×retention)", "", "", "not analyst forecasts"])
+                rows.append(["  1. We use fundamental growth (ROE x retention)", "", "", "not analyst forecasts"])
                 rows.append(["  2. Our WACC may be higher (more conservative)", "", "", ""])
                 rows.append(["  3. Analysts may factor in optionality/catalysts", "", "", "we don't"])
                 rows.append(["  4. Our terminal growth may be lower", "", "", ""])
@@ -1256,6 +1733,7 @@ def _write_analyst_consensus(
     df.to_excel(writer, sheet_name="Analyst Consensus", index=False)
 
     ws = _ws(writer, "Analyst Consensus")
+    _hide_gridlines(ws)
     _style_header_row(ws, 1, n_cols)
 
     pct_rows = {"year 1 growth", "terminal growth", "accuracy"}
@@ -1272,13 +1750,13 @@ def _write_analyst_consensus(
                 in_top_analysts = False
             continue
 
-        # Style top analysts sub-header row (Analyst | Firm | Accuracy | ...)
+        # Style top analysts sub-header row
         if label_lower == "analyst":
             _style_header_row(ws, row_idx, n_cols)
             in_top_analysts = True
             continue
 
-        # Format accuracy column (col 3) as percentage in top analysts block
+        # Format accuracy column as percentage in top analysts block
         if in_top_analysts:
             acc_cell = ws.cell(row=row_idx, column=3)
             if isinstance(acc_cell.value, (int, float)) and abs(acc_cell.value) <= 1:
@@ -1302,7 +1780,7 @@ def _write_analyst_consensus(
 
 
 def _write_data_sources(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
-    """Sheet 7: Data source transparency — where every input came from."""
+    """Sheet 7: Data source transparency -- where every input came from."""
     rows = [
         ["DATA SOURCE TRANSPARENCY", "", ""],
         ["Every input is traced to its source", "", ""],
@@ -1361,6 +1839,7 @@ def _write_data_sources(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
     df.to_excel(writer, sheet_name="Data Sources", index=False)
 
     ws = _ws(writer, "Data Sources")
+    _hide_gridlines(ws)
     _style_header_row(ws, 1, 3)
 
     for row_idx in range(2, ws.max_row + 1):
@@ -1409,16 +1888,11 @@ _IS_COL_ORDER: dict[str, list[str]] = {
 
 
 def _reorder_financial_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
-    """Reorder rows (line items) of a financial statement DataFrame into standard order.
-
-    Rows whose index label matches a known canonical name are placed first in the
-    prescribed order; any remaining rows are appended afterward.
-    """
+    """Reorder rows (line items) of a financial statement DataFrame into standard order."""
     canonical = _IS_COL_ORDER.get(sheet_name, [])
     if not canonical:
         return df
 
-    # Build a case-insensitive lookup: lower(label) → original index label
     existing = {str(idx).lower(): idx for idx in df.index}
 
     ordered_idx: list = []
@@ -1430,7 +1904,6 @@ def _reorder_financial_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
             ordered_idx.append(orig)
             seen.add(orig)
 
-    # Append any remaining rows not in the canonical list
     for idx in df.index:
         if idx not in seen:
             ordered_idx.append(idx)
@@ -1439,7 +1912,7 @@ def _reorder_financial_rows(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
 
 def _write_financials(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
-    """Sheet 8: Raw financial statements — rows=line items, columns=fiscal years."""
+    """Sheet 8: Raw financial statements -- rows=line items, columns=fiscal years."""
     sheets = [
         ("income_statement", "Income Statement"),
         ("balance_sheet", "Balance Sheet"),
@@ -1451,43 +1924,30 @@ def _write_financials(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
         if df_raw is None:
             continue
 
-        # Normalise orientation: rows = line items, columns = fiscal years
-        # yfinance returns DataFrames where rows=dates, columns=items OR
-        # rows=items, columns=dates. We want rows=items, columns=dates (years).
-        # Heuristic: if the index looks like dates (Timestamp / string year)
-        # and the columns look like item names (strings), we transpose.
         df = df_raw.copy()
 
         index_is_dates = _looks_like_dates(df.index)
         cols_are_dates = _looks_like_dates(df.columns)
 
         if index_is_dates and not cols_are_dates:
-            # rows=dates, cols=items → transpose to rows=items, cols=dates
             df = df.T
         elif cols_are_dates:
-            # Already rows=items, cols=dates — nothing to do
             pass
-        # else: ambiguous; leave as-is
 
-        # Sort columns (fiscal years) descending (most recent first)
         try:
             df = df.sort_index(axis=1, ascending=False)
         except TypeError:
-            pass  # Mixed types in columns; skip sort
+            pass
 
-        # Reorder rows into standard reporting order
         df = _reorder_financial_rows(df, sheet_name)
-
-        # Write to Excel
         df.to_excel(writer, sheet_name=sheet_name)
 
         ws = _ws(writer, sheet_name)
-        n_cols = df.shape[1] + 1  # +1 for index column
+        _hide_gridlines(ws)
+        n_cols = df.shape[1] + 1
 
-        # Header row styling
         _style_header_row(ws, 1, n_cols)
 
-        # Format values
         for row_idx in range(2, ws.max_row + 1):
             label_cell = ws.cell(row=row_idx, column=1)
             label = label_cell.value or ""
@@ -1498,7 +1958,6 @@ def _write_financials(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                 cell = ws.cell(row=row_idx, column=col_idx)
                 if isinstance(cell.value, (int, float)):
                     label_lower = str(label).lower()
-                    # Margin/ratio/rate rows → percentage format
                     if any(kw in label_lower for kw in ("margin", "rate", "ratio", "yield", "growth")):
                         if abs(cell.value) <= 5:
                             cell.number_format = _FMT_PCT
@@ -1508,11 +1967,12 @@ def _write_financials(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
                         cell.number_format = _FMT_INT
                     cell.alignment = _RIGHT
 
-                    # Negative numbers in red
                     if cell.value < 0:
                         cell.font = Font(name="Calibri", size=10, color=_RED)
 
-        # Column widths: label column wider, data columns narrower
+                    # All financial statement data is from source (green)
+                    cell.fill = _FACT_FILL
+
         ws.column_dimensions["A"].width = 35
         for col_idx in range(2, n_cols + 1):
             ws.column_dimensions[get_column_letter(col_idx)].width = 15
@@ -1529,17 +1989,14 @@ def _looks_like_dates(index) -> bool:
     if len(index) == 0:
         return False
     sample = index[0]
-    # pd.Timestamp
     if isinstance(sample, pd.Timestamp):
         return True
-    # datetime.date / datetime.datetime
     try:
         from datetime import date as _date, datetime as _datetime
         if isinstance(sample, (_date, _datetime)):
             return True
     except ImportError:
         pass
-    # String that looks like a year or ISO date
     if isinstance(sample, str):
         s = sample.strip()
         if len(s) == 4 and s.isdigit():
