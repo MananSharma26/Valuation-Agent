@@ -47,7 +47,10 @@ def _extract_values(model_outputs: dict[str, dict]) -> dict[str, float]:
 
     Handles different output formats:
       - dcf_fcff / dcf_fcfe: key "equity_value_per_share" or "value_per_share"
-      - relative: keys like "implied_value_pe", "implied_value_eveb", etc.
+      - relative: ONE entry using "composite_value"; falls back to averaging
+        individual multiples if composite is absent.  Individual multiples are
+        intentionally excluded from the stats dict to avoid giving the relative
+        family multiple votes in the mean/divergence calculation.
       - excess_returns: key "value_per_share"
 
     Returns dict mapping descriptive name -> value.
@@ -68,26 +71,33 @@ def _extract_values(model_outputs: dict[str, dict]) -> dict[str, float]:
                     break
 
         elif model_name == "relative":
-            # Check both naming conventions
-            rel_keys = {
-                "pe_value": "relative_pe",
-                "ev_ebitda_value": "relative_ev_ebitda",
-                "pbv_value": "relative_pbv",
-                "ps_value": "relative_ps",
-                "composite_value": "relative_composite",
-            }
-            for key, label in rel_keys.items():
-                if key in output and output[key] is not None:
-                    fval = float(output[key])
-                    if fval > 0:
-                        values[label] = fval
-            # Also check implied_value_ prefix
-            for key, val in output.items():
-                if key.startswith("implied_value_") and isinstance(val, (int, float)):
-                    fval = float(val)
-                    if fval > 0:
-                        suffix = key.replace("implied_value_", "")
-                        values[f"relative_{suffix}"] = fval
+            # Relative valuation is ONE model family — use composite only.
+            # Individual multiples (pe_value, ev_ebitda_value, etc.) remain
+            # accessible in the raw output for report diagnostics, but they
+            # must NOT each get an independent vote in the mean/divergence calc.
+            comp = output.get("composite_value")
+            if comp is None:
+                # Fall back: compute a simple average of any available individual
+                # multiples so we still get one representative value.
+                candidates: list[float] = []
+                for key in ("pe_value", "ev_ebitda_value", "pbv_value", "ps_value"):
+                    v = output.get(key)
+                    if v is not None:
+                        fv = float(v)
+                        if fv > 0:
+                            candidates.append(fv)
+                # Also accept implied_value_ prefix keys
+                for key, v in output.items():
+                    if key.startswith("implied_value_") and isinstance(v, (int, float)):
+                        fv = float(v)
+                        if fv > 0:
+                            candidates.append(fv)
+                if candidates:
+                    comp = sum(candidates) / len(candidates)
+            if comp is not None:
+                fcomp = float(comp)
+                if fcomp > 0:
+                    values["relative"] = fcomp
 
         elif model_name == "excess_returns":
             if "value_per_share" in output:
@@ -208,7 +218,7 @@ def explain_divergence(result: CrossValidationResult, ctx: Any = None) -> str:
     vals = result.individual_values
 
     dcf_val = vals.get("dcf_fcff") or vals.get("dcf_fcfe")
-    rel_val = vals.get("relative_composite")
+    rel_val = vals.get("relative")
 
     if dcf_val and rel_val:
         if dcf_val < rel_val:

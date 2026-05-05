@@ -104,7 +104,8 @@ def fetch_ibes_consensus(company_name: str, ticker: str = "", currency: str = "I
 
 def run(ticker: str, growth_override: float | None = None,
         terminal_override: float | None = None,
-        classification_override: str | None = None) -> None:
+        classification_override: str | None = None,
+        accept_defaults: bool = False) -> None:
     """Run full valuation pipeline."""
 
     print(f"\n{'='*70}")
@@ -322,7 +323,6 @@ def run(ticker: str, growth_override: float | None = None,
 
     total_debt = float(latest_bs.get('Total Debt', 0) or 0)
     market_cap = data.market_cap
-    company_de = total_debt / market_cap if market_cap > 0 else 0
 
     tax_prov = float(latest_inc.get('Tax Provision', 0) or 0)
     pretax = float(latest_inc.get('Pretax Income', 0) or 0)
@@ -331,6 +331,71 @@ def run(ticker: str, growth_override: float | None = None,
     ebit = float(latest_inc.get('Operating Income', 0) or 0)
     interest = float(latest_inc.get('Interest Expense', 0) or 0)
     icr = ebit / interest if interest > 0 else 50
+
+    # Extract revenue and cash early (needed for adjustments)
+    revenue = float(latest_inc.get('Total Revenue', 0) or 0)
+    cash = float(latest_bs.get('Cash And Cash Equivalents', 0) or 0)
+
+    # ---- Step 5a: R&D Capitalization (before WACC) ----
+    rd_adj = 0.0
+    research_asset = 0.0
+    rd_col = None
+    for col in inc.columns:
+        if 'research' in col.lower() and 'development' in col.lower():
+            rd_col = col
+            break
+    if rd_col:
+        current_rd = abs(float(latest_inc.get(rd_col, 0) or 0))
+        if current_rd > 0:
+            past_rd = []
+            for i in range(1, min(len(inc), 6)):
+                val = abs(float(inc.iloc[i].get(rd_col, 0) or 0))
+                if val > 0:
+                    past_rd.append(val)
+            amort_years = get_amortization_period(ctx.company.damodaran_industry or "")
+            rd_result = capitalize_rd(current_rd, past_rd, amort_years)
+            rd_adj = rd_result["ebit_adjustment"]
+            research_asset = rd_result["research_asset"]
+            print(f"  R&D: +{rd_adj:,.0f} EBIT adj | Asset: {research_asset:,.0f}")
+
+    # ---- Step 5b: Operating Lease Capitalization (before WACC) ----
+    lease_debt = 0.0
+    lease_ebit_adj = 0.0
+    for col in inc.columns:
+        if 'lease' in col.lower() or 'rent' in col.lower():
+            lease_exp = abs(float(latest_inc.get(col, 0) or 0))
+            if lease_exp > 0:
+                from valuation.engines.adjustments import estimate_lease_debt
+                lease_result = estimate_lease_debt(lease_exp, 0.07)  # use approximate Kd
+                lease_debt = lease_result["lease_debt"]
+                lease_ebit_adj = lease_result["ebit_adjustment"]
+                print(f"  Leases: debt={lease_debt:,.0f} | EBIT adj=+{lease_ebit_adj:,.0f}")
+                break
+
+    # ---- Step 5c: Adjusted financials ----
+    adjusted_ebit = ebit + rd_adj + lease_ebit_adj
+    adjusted_total_debt = total_debt + lease_debt
+
+    # Invested capital: Book Equity + Book Debt + Lease Debt - Cash + Research Asset
+    book_equity = float(latest_bs.get('Total Stockholders Equity', 0) or 0)
+    if book_equity <= 0:
+        book_equity = data.book_value_per_share * data.shares_outstanding if data.book_value_per_share else 0
+    adjusted_invested_capital = book_equity + adjusted_total_debt - cash + research_asset
+    if adjusted_invested_capital <= 0:
+        adjusted_invested_capital = revenue / 2  # fallback
+
+    # S2C from ADJUSTED invested capital
+    s2c = revenue / adjusted_invested_capital if adjusted_invested_capital > 0 else 2.0
+    s2c = max(min(s2c, 10.0), 0.5)
+
+    # Adjusted margin (R&D + lease adjusted)
+    adjusted_margin = adjusted_ebit / revenue if revenue > 0 else 0.15
+
+    # D/E from adjusted debt
+    company_de = adjusted_total_debt / market_cap if market_cap > 0 else 0
+
+    print(f"  Adjusted EBIT: {adjusted_ebit:,.0f} | IC: {adjusted_invested_capital:,.0f} | S2C: {s2c:.2f}")
+    print(f"  Adjusted margin: {adjusted_margin:.1%} | D/E: {company_de:.4f}")
 
     is_india = ctx.company.region == "India"
     is_japan = ctx.company.region == "Japan"
@@ -494,23 +559,7 @@ def run(ticker: str, growth_override: float | None = None,
     sourced_inputs["wacc"] = computed(wacc, "Ke*E/(D+E) + Kd*(1-t)*D/(D+E)")
     sourced_inputs["tax_rate"] = computed(tax_rate, "Tax Provision / Pretax Income")
 
-    # Operating lease adjustment (if lease/rent expense available)
-    lease_debt = 0.0
-    lease_ebit_adj = 0.0
-    try:
-        for col in inc.columns:
-            if 'lease' in col.lower() or 'rent' in col.lower() or 'operating lease' in col.lower():
-                lease_exp = abs(float(latest_inc.get(col, 0) or 0))
-                if lease_exp > 0:
-                    from valuation.engines.adjustments import estimate_lease_debt
-                    lease_result = estimate_lease_debt(lease_exp, cod)
-                    lease_debt = lease_result["lease_debt"]
-                    lease_ebit_adj = lease_result["ebit_adjustment"]
-                    total_debt += lease_debt  # Add to total debt
-                    print(f"  Operating lease debt: {lease_debt:,.0f} (from '{col}', expense: {lease_exp:,.0f})")
-                    break
-    except Exception:
-        pass
+    # (Operating lease and R&D adjustments already applied in Step 5a/5b above)
 
     # Options deduction (if data available)
     # yfinance doesn't reliably provide options data
@@ -533,7 +582,7 @@ def run(ticker: str, growth_override: float | None = None,
 
     # Compute actual company metrics
     net_income = float(latest_inc.get('Net Income', 0) or 0)
-    revenue = float(latest_inc.get('Total Revenue', 0) or 0)
+    # revenue already extracted in Step 5
     equity_bv = data.book_value_per_share * data.shares_outstanding if data.book_value_per_share else 0
     roe = net_income / equity_bv if equity_bv > 0 else 0
     dividends = data.dividend_per_share * data.shares_outstanding if data.dividend_per_share else 0
@@ -660,6 +709,17 @@ def run(ticker: str, growth_override: float | None = None,
         print(f"  Proposal generation error: {e}")
         proposals = []
 
+    # ---- Assumption Gate ----
+    if not accept_defaults:
+        print(f"\n{'='*70}")
+        print("  ASSUMPTION GATE: Review above proposals before proceeding.")
+        print("  To run the valuation with these assumptions:")
+        print(f"    python3 run_valuation.py {ticker} --accept-defaults")
+        print("  To override specific assumptions:")
+        print(f"    python3 run_valuation.py {ticker} --accept-defaults --growth 0.15 --terminal 0.04")
+        print(f"{'='*70}")
+        sys.exit(0)
+
     # ================================================================
     # STEP 7: Validate Before Engines
     # ================================================================
@@ -696,9 +756,9 @@ def run(ticker: str, growth_override: float | None = None,
     # STEP 8: Run Valuation Engines
     # ================================================================
     print(f"\n--- Step 8: Valuation Engines ---")
-    ebit_at = ebit * (1 - tax_rate)
+    ebit_at = adjusted_ebit * (1 - tax_rate)
     ebitda = float(latest_inc.get('EBITDA', 0) or 0)
-    cash = float(latest_bs.get('Cash And Cash Equivalents', 0) or 0)
+    # cash already extracted in Step 5
 
     capex = abs(float(cf.iloc[0].get('Capital Expenditure', 0) or 0)) if cf is not None and len(cf) > 0 else 0
     depr = float(cf.iloc[0].get('Depreciation And Amortization', 0) or 0) if cf is not None and len(cf) > 0 else 0
@@ -738,57 +798,48 @@ def run(ticker: str, growth_override: float | None = None,
         print(f"  [Excess Returns] Value/Share: {er_result['value_per_share']:,.2f}")
     else:
         # FCFF v2 — revenue-based with Damodaran transitions
-        # R&D capitalization
-        rd_adj = 0.0
-        research_asset = 0.0
-        rd_col = None
-        for col in inc.columns:
-            if 'research' in col.lower() and 'development' in col.lower():
-                rd_col = col
-                break
-        if rd_col:
-            current_rd = abs(float(latest_inc.get(rd_col, 0) or 0))
-            if current_rd > 0:
-                past_rd = []
-                for i in range(1, min(len(inc), 6)):
-                    val = abs(float(inc.iloc[i].get(rd_col, 0) or 0))
-                    if val > 0:
-                        past_rd.append(val)
-                amort_years = get_amortization_period(ctx.company.damodaran_industry or "")
-                rd_result = capitalize_rd(current_rd, past_rd, amort_years)
-                rd_adj = rd_result["ebit_adjustment"]
-                research_asset = rd_result["research_asset"]
-                print(f"  [R&D Cap] Current R&D: {current_rd:,.0f} | Asset: {research_asset:,.0f} | EBIT adj: +{rd_adj:,.0f}")
+        # (R&D and lease adjustments already applied in Step 5a/5b)
 
-        # Terminal WACC (Damodaran: Rf + 4.5% + CRP)
-        t_wacc = terminal_wacc_default(rf, crp if crp else 0.0)
-        # Allow override if user specified stable WACC lower
-        stable_roc = 0.20  # competitive advantage persists for quality companies
+        # Stable-state assumptions (Damodaran: risk/returns converge toward market average)
+        stable_beta = min(max(beta * 0.7, 0.8), 1.2)  # converges toward 1.0
+        stable_crp_adj = crp * 0.67 if crp > 0 else 0  # country risk reduces over time
+        stable_ke = compute_cost_of_equity(rf, stable_beta, erp, stable_crp_adj, lam)
+
+        # Stable D/E: company moves toward industry leverage
+        stable_de = (ctx.benchmarks.industry_de_ratio or 0.20) if company_de < 0.05 else company_de
+        stable_eq_w = 1 / (1 + stable_de)
+        stable_dbt_w = stable_de / (1 + stable_de)
+        stable_kd = cod  # same cost of debt
+        stable_tax = 0.25  # marginal
+        stable_wacc = compute_wacc(stable_ke, stable_kd, stable_tax, stable_eq_w, stable_dbt_w)
+
+        # Stable ROC: converges toward WACC (competitive advantages fade)
+        # Damodaran: Amazon uses 10%, Nvidia uses 20%, 3M stable ROC ~ WACC
+        industry_roc = ctx.benchmarks.industry_margins.get("roic") if ctx.benchmarks.industry_margins else None
+        if industry_roc and industry_roc > stable_wacc:
+            stable_roc = min(industry_roc, stable_wacc * 2)  # cap at 2x WACC
+        else:
+            stable_roc = stable_wacc * 1.1  # slight excess returns persist
+
+        print(f"  Stable: WACC={stable_wacc:.2%}, ROC={stable_roc:.2%}, Beta={stable_beta:.2f}, CRP={stable_crp_adj:.2%}")
 
         # Generate Damodaran-style schedules
-        wacc_sched = wacc_schedule(wacc, t_wacc, n_years, n_constant=5)
+        wacc_sched = wacc_schedule(wacc, stable_wacc, n_years, n_constant=5)
         tax_sched = tax_schedule(tax_rate, 0.25, n_years, n_constant=5)
 
-        # Operating margin convergence
-        current_margin = ebit / revenue if revenue > 0 else 0.15
-        target_margin = min(current_margin, 0.60)  # cap at 60% (Damodaran Nvidia convention)
-        if current_margin < 0.15:
-            target_margin = max(current_margin, ctx.benchmarks.industry_margins.get("operating_margin", 0.15) or 0.15)
-        margin_sched = margin_convergence_schedule(current_margin, target_margin, convergence_year=5, n_years=n_years)
+        # Operating margin convergence (from adjusted margin)
+        target_margin = min(adjusted_margin, 0.60)  # cap at 60% (Damodaran Nvidia convention)
+        if adjusted_margin < 0.15:
+            target_margin = max(adjusted_margin, ctx.benchmarks.industry_margins.get("operating_margin", 0.15) or 0.15)
+        margin_sched = margin_convergence_schedule(adjusted_margin, target_margin, convergence_year=5, n_years=n_years)
 
-        # Sales-to-capital ratio from financials
-        total_assets = float(latest_bs.get('Total Assets', 0) or 0)
-        invested_capital = total_assets - cash + research_asset
-        s2c = revenue / invested_capital if invested_capital > 0 else 2.5
-        s2c = max(min(s2c, 10.0), 0.5)  # bound
-
-        sourced_inputs["sales_to_capital"] = computed(s2c, "Revenue / Invested Capital (from balance sheet)")
-        print(f"  [Schedules] WACC: {wacc:.2%} → {t_wacc:.2%} | Tax: {tax_rate:.1%} → 25%")
-        print(f"  [Schedules] Margin: {current_margin:.1%} → {target_margin:.1%} | S2C: {s2c:.2f}")
+        sourced_inputs["sales_to_capital"] = computed(s2c, "Revenue / Adjusted Invested Capital")
+        print(f"  [Schedules] WACC: {wacc:.2%} -> {stable_wacc:.2%} | Tax: {tax_rate:.1%} -> 25%")
+        print(f"  [Schedules] Margin: {adjusted_margin:.1%} -> {target_margin:.1%} | S2C: {s2c:.2f}")
 
         fcff_result = fcff_valuation_v2(
             base_revenue=revenue,
-            base_ebit=ebit,
+            base_ebit=adjusted_ebit,
             revenue_growth_rates=growth_rates,
             operating_margins=margin_sched,
             tax_rates=tax_sched,
@@ -796,17 +847,17 @@ def run(ticker: str, growth_override: float | None = None,
             sales_to_capital=s2c,
             stable_growth=terminal_growth,
             stable_roc=stable_roc,
-            stable_wacc=t_wacc,
+            stable_wacc=stable_wacc,
             stable_tax_rate=0.25,
             cash=cash,
-            debt=total_debt,
+            debt=adjusted_total_debt,
             non_operating_assets=0.0,
             minority_interests=0.0,
             options_value=0.0,
             shares_outstanding=data.shares_outstanding,
-            rd_adjustment=rd_adj,
+            rd_adjustment=0,  # already applied to base_ebit
             research_asset=research_asset,
-            base_invested_capital=invested_capital,
+            base_invested_capital=adjusted_invested_capital,
         )
         ctx.outputs.dcf_fcff = fcff_result
         print(f"  [FCFF DCF v2] Value/Share: {fcff_result['equity_value_per_share']:,.2f}")
@@ -838,7 +889,7 @@ def run(ticker: str, growth_override: float | None = None,
     rel = relative_valuation(
         eps=eps, ebitda=ebitda, book_value_per_share=data.book_value_per_share,
         revenue_per_share=rev_ps, industry_multiples=ctx.benchmarks.industry_multiples,
-        debt=total_debt, cash=cash, shares_outstanding=data.shares_outstanding,
+        debt=adjusted_total_debt, cash=cash, shares_outstanding=data.shares_outstanding,
         market_price=data.price,
     )
     ctx.outputs.relative = rel.to_dict()
@@ -896,7 +947,7 @@ def run(ticker: str, growth_override: float | None = None,
     if ctx.outputs.dcf_fcff and ctx.company.classification != "financial":
         base_params = dict(
             base_revenue=revenue,
-            base_ebit=ebit,
+            base_ebit=adjusted_ebit,
             revenue_growth_rates=growth_rates,
             operating_margins=margin_sched,
             tax_rates=tax_sched,
@@ -904,18 +955,18 @@ def run(ticker: str, growth_override: float | None = None,
             sales_to_capital=s2c,
             stable_growth=terminal_growth,
             stable_roc=stable_roc,
-            stable_wacc=t_wacc,
+            stable_wacc=stable_wacc,
             stable_tax_rate=0.25,
-            cash=cash, debt=total_debt,
+            cash=cash, debt=adjusted_total_debt,
             shares_outstanding=data.shares_outstanding,
-            rd_adjustment=rd_adj,
+            rd_adjustment=0,
             research_asset=research_asset,
-            base_invested_capital=invested_capital,
+            base_invested_capital=adjusted_invested_capital,
         )
         extract_fn = lambda **kw: fcff_valuation_v2(**kw)["equity_value_per_share"]
 
         # One-way: vary terminal WACC (which drives the schedule)
-        base_t_wacc = t_wacc if ctx.company.classification != "financial" else wacc
+        base_t_wacc = stable_wacc if ctx.company.classification != "financial" else wacc
         wacc_offsets = [-0.02, -0.01, 0, 0.01, 0.02]
         wacc_sens = {}
         for offset in wacc_offsets:
@@ -1104,8 +1155,10 @@ def main():
     parser.add_argument("--classification", type=str, default=None,
                         choices=["mature", "growth", "young", "distressed", "cyclical", "financial"],
                         help="Override company classification")
+    parser.add_argument("--accept-defaults", action="store_true", default=False,
+                        help="Accept computed assumptions and run valuation without stopping")
     args = parser.parse_args()
-    run(args.ticker, args.growth, args.terminal, args.classification)
+    run(args.ticker, args.growth, args.terminal, args.classification, args.accept_defaults)
 
 
 if __name__ == "__main__":

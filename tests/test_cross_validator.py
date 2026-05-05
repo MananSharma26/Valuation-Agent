@@ -7,7 +7,11 @@ from valuation.agents.cross_validator import (
 
 class TestCrossValidate:
     def test_all_models_agree(self):
-        """All models produce similar values => low divergence, no flags."""
+        """All models produce similar values => low divergence, no flags.
+
+        relative is ONE family (composite or averaged multiples), so
+        dcf_fcff + relative = 2 models, not 3.
+        """
         result = cross_validate(
             model_outputs={
                 "dcf_fcff": {"equity_value_per_share": 100.0},
@@ -20,11 +24,15 @@ class TestCrossValidate:
         assert result.median_value > 0
         assert abs(result.mean_value - 100.0) < 5.0
         assert result.max_divergence_pct < 0.15
-        assert result.num_models == 3
+        # relative counts as ONE family vote, so 2 models total
+        assert result.num_models == 2
         assert len(result.flags) == 0
 
     def test_large_divergence_flagged(self):
-        """Models diverge >50% => flag raised."""
+        """Models diverge >50% => flag raised.
+
+        dcf=50, relative (single multiple fallback)=150  =>  divergence=200%.
+        """
         result = cross_validate(
             model_outputs={
                 "dcf_fcff": {"equity_value_per_share": 50.0},
@@ -92,7 +100,10 @@ class TestCrossValidate:
         assert abs(result.mean_value - 105.0) < 1.0
 
     def test_negative_values_excluded(self):
-        """Negative model values are excluded from statistics."""
+        """Negative model values are excluded from statistics.
+
+        dcf is negative (excluded); relative single-multiple fallback = 100.
+        """
         result = cross_validate(
             model_outputs={
                 "dcf_fcff": {"equity_value_per_share": -50.0},
@@ -104,7 +115,11 @@ class TestCrossValidate:
         assert result.mean_value == 100.0
 
     def test_result_contains_individual_values(self):
-        """Result dict includes per-model values."""
+        """Result dict has one 'relative' entry (composite family), not per-multiple keys.
+
+        When composite_value is absent the fallback averages individual multiples:
+        avg(90, 110) = 100.0.
+        """
         result = cross_validate(
             model_outputs={
                 "dcf_fcff": {"equity_value_per_share": 100.0},
@@ -113,9 +128,13 @@ class TestCrossValidate:
             price=100.0,
         )
         assert "dcf_fcff" in result.individual_values
-        assert "relative_pe" in result.individual_values
-        assert "relative_eveb" in result.individual_values
+        # One family key, not per-multiple keys
+        assert "relative" in result.individual_values
+        assert "relative_pe" not in result.individual_values
+        assert "relative_eveb" not in result.individual_values
         assert result.individual_values["dcf_fcff"] == 100.0
+        # avg(90, 110) = 100.0
+        assert result.individual_values["relative"] == 100.0
 
     def test_to_dict(self):
         """CrossValidationResult can be serialized to dict."""

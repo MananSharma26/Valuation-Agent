@@ -438,110 +438,435 @@ def _write_summary(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
 
 
 def _write_assumptions(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:
-    """Sheet 2: All assumptions with sources and overrides."""
+    """Sheet 2: All assumptions in a FIXED layout so DCF Model can cross-reference.
+
+    Layout (rows are 1-indexed as they appear in the Excel file):
+        Row 1:  Header row (Parameter / Value / Source)
+        Row 2:  (blank)
+        Row 3:  RISK PARAMETERS (section header)
+        Row 4:  Risk-Free Rate          [B4]  blue
+        Row 5:  Beta (levered)          [B5]  blue
+        Row 6:  ERP                     [B6]  blue
+        Row 7:  Lambda                  [B7]  blue
+        Row 8:  CRP                     [B8]  blue
+        Row 9:  Cost of Equity          [B9]  formula: =B4+B5*B6+B7*B8
+        Row 10: Cost of Debt (pre-tax)  [B10] gray
+        Row 11: Tax Rate (effective)    [B11] blue
+        Row 12: Marginal Tax Rate       [B12] blue (for terminal)
+        Row 13: Debt/(Debt+Equity)      [B13] green
+        Row 14: WACC                    [B14] formula: =B9*(1-B13)+B10*(1-B11)*B13
+        Row 15: (blank)
+        Row 16: GROWTH & MARGINS (section header)
+        Row 17: Revenue Growth (High)   [B17] blue
+        Row 18: Terminal Growth          [B18] blue
+        Row 19: Operating Margin         [B19] blue
+        Row 20: Target Margin (Stable)   [B20] blue
+        Row 21: Sales-to-Capital         [B21] blue
+        Row 22: Stable ROC               [B22] blue
+        Row 23: Convergence Year         [B23] blue
+        Row 24: (blank)
+        Row 25: COMPANY DATA (section header)
+        Row 26: Base Revenue             [B26] green
+        Row 27: Base EBIT                [B27] green
+        Row 28: Cash                     [B28] green
+        Row 29: Total Debt               [B29] green
+        Row 30: Shares Outstanding       [B30] green
+        Row 31: Current Price            [B31] green
+    """
     a = ctx.assumptions
-    rows = [
-        ["RISK PARAMETERS", "", ""],
-        ["Risk-Free Rate", a.risk_free_rate, "Damodaran / Govt bond yield"],
-        ["Equity Risk Premium", a.erp, "Damodaran implied ERP"],
-        ["Country Risk Premium", a.country_risk_premium, "Damodaran ctryprem"],
-        ["Beta (levered)", a.beta, "Industry bottom-up, re-levered"],
-        ["Cost of Equity", a.cost_of_equity, "CAPM: Rf + Beta*ERP + Lambda*CRP"],
-        ["Cost of Debt (pre-tax)", a.cost_of_debt, "Synthetic rating"],
-        ["WACC", a.wacc, "Ke*E/(D+E) + Kd*(1-t)*D/(D+E)"],
-        ["Tax Rate", a.tax_rate, "Effective from financials"],
-        ["", "", ""],
-        ["GROWTH PARAMETERS", "", ""],
-        ["Terminal Growth", a.terminal_growth, "Nominal GDP growth"],
-        ["Projection Years", a.projection_years, ""],
-    ]
 
-    if a.growth_rates:
-        rows.append(["", "", ""])
-        rows.append(["YEAR-BY-YEAR GROWTH", "", ""])
-        for i, g in enumerate(a.growth_rates):
-            rows.append([f"Year {i+1}", g, ""])
+    # Extract company data from balance sheet / key_stats / dcf output
+    d = ctx.outputs.dcf_fcff or {}
+    stats = ctx.financials.key_stats
 
+    # Base revenue and EBIT from dcf output or financials
+    base_revenue = d.get("base_revenue")
+    base_ebit = d.get("base_ebit")
+    if base_revenue is None:
+        yearly_rev = d.get("yearly_revenue", [])
+        if yearly_rev and a.growth_rates:
+            g0 = a.growth_rates[0]
+            base_revenue = yearly_rev[0] / (1 + g0) if g0 != -1 else yearly_rev[0]
+    if base_ebit is None and base_revenue:
+        yearly_ebit = d.get("yearly_ebit", [])
+        if yearly_ebit and yearly_rev:
+            # Infer base margin from first-year margin applied to base revenue
+            base_ebit = yearly_ebit[0] / (1 + (a.growth_rates[0] if a.growth_rates else 0))
+
+    # Cash and debt from balance sheet
+    cash = 0.0
+    total_debt = 0.0
+    if ctx.financials.balance_sheet is not None:
+        bs = ctx.financials.balance_sheet
+        # Handle both orientations
+        if hasattr(bs, 'iloc') and len(bs) > 0:
+            # Try to get latest year data
+            try:
+                if _looks_like_dates(bs.index):
+                    latest = bs.iloc[0]
+                elif _looks_like_dates(bs.columns):
+                    latest = bs.iloc[:, 0]
+                else:
+                    latest = bs.iloc[0]
+                cash = float(latest.get('Cash And Cash Equivalents', 0) or 0)
+                total_debt = float(latest.get('Total Debt', 0) or 0)
+            except (KeyError, TypeError, IndexError):
+                pass
+
+    shares = stats.get("shares_outstanding") or 0
+    price = stats.get("price") or 0
+    market_cap = stats.get("market_cap") or (price * shares if price and shares else 0)
+
+    # Debt weight
+    debt_weight = total_debt / (market_cap + total_debt) if (market_cap + total_debt) > 0 else 0
+
+    # Lambda (default 1.0 unless we can find it from cost_of_equity decomposition)
+    lambda_val = 1.0
+    if (a.cost_of_equity is not None and a.risk_free_rate is not None
+            and a.beta is not None and a.erp is not None
+            and a.country_risk_premium and a.country_risk_premium > 0):
+        # Ke = Rf + Beta*ERP + Lambda*CRP  =>  Lambda = (Ke - Rf - Beta*ERP) / CRP
+        implied_lambda = (a.cost_of_equity - a.risk_free_rate - a.beta * a.erp) / a.country_risk_premium
+        if 0 <= implied_lambda <= 2:
+            lambda_val = round(implied_lambda, 4)
+
+    # Operating margin (current)
+    current_margin = 0.0
+    if base_revenue and base_ebit and base_revenue > 0:
+        current_margin = base_ebit / base_revenue
+
+    # Target margin and S2C from dcf output schedules
+    yearly_ebit_list = d.get("yearly_ebit", [])
+    yearly_rev_list = d.get("yearly_revenue", [])
+    target_margin = current_margin
+    if yearly_ebit_list and yearly_rev_list and yearly_rev_list[-1]:
+        target_margin = yearly_ebit_list[-1] / yearly_rev_list[-1]
+
+    # Sales-to-capital from reinvestment data
+    s2c = 2.0  # default
+    yearly_reinv = d.get("yearly_reinvestment", [])
+    if yearly_rev_list and yearly_reinv:
+        for t in range(len(yearly_reinv)):
+            prev_rev = base_revenue if t == 0 else yearly_rev_list[t - 1]
+            curr_rev = yearly_rev_list[t] if t < len(yearly_rev_list) else 0
+            reinv = yearly_reinv[t]
+            if reinv and reinv != 0:
+                s2c = (curr_rev - prev_rev) / reinv if prev_rev else s2c
+                break  # use first year's implied S2C
+
+    # Stable ROC
+    stable_roc = 0.20  # default
+    yearly_roic = d.get("yearly_roic", [])
+    if yearly_roic and yearly_roic[-1] and yearly_roic[-1] > 0:
+        stable_roc = yearly_roic[-1]
+
+    # Revenue growth (high)
+    high_growth = a.growth_rates[0] if a.growth_rates else 0.0
+
+    # Marginal tax rate (for terminal year)
+    marginal_tax = 0.25  # Damodaran convention for terminal
+    # If we have tax schedule data in the dcf output, use last year
+    yearly_ebit_at = d.get("yearly_ebit_at", [])
+    if yearly_ebit_list and yearly_ebit_at and yearly_ebit_list[-1] and yearly_ebit_list[-1] != 0:
+        terminal_tax_implied = 1 - yearly_ebit_at[-1] / yearly_ebit_list[-1]
+        if 0 < terminal_tax_implied < 0.5:
+            marginal_tax = terminal_tax_implied
+
+    # Convergence year (how many years margin converges)
+    convergence_year = 5  # default
+
+    # --- Write the fixed-layout sheet using openpyxl directly ---
+    empty_df = pd.DataFrame([[""] * 3])
+    empty_df.to_excel(writer, sheet_name="Assumptions", index=False, header=False)
+    ws = _ws(writer, "Assumptions")
+    _hide_gridlines(ws)
+
+    # Row 1: Header
+    ws.cell(row=1, column=1, value="Parameter")
+    ws.cell(row=1, column=2, value="Value")
+    ws.cell(row=1, column=3, value="Source / Rationale")
+    _style_header_row(ws, 1, 3)
+
+    # Row 2: blank
+
+    # Row 3: RISK PARAMETERS section header
+    ws.cell(row=3, column=1, value="RISK PARAMETERS")
+    _style_section_title(ws, 3, 3)
+
+    # Row 4: Risk-Free Rate [B4] blue
+    ws.cell(row=4, column=1, value="Risk-Free Rate").font = _NORMAL_FONT
+    cell = ws.cell(row=4, column=2, value=a.risk_free_rate or 0)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=4, column=3, value="Damodaran / Govt bond yield").font = _NORMAL_FONT
+
+    # Row 5: Beta (levered) [B5] blue
+    ws.cell(row=5, column=1, value="Beta (levered)").font = _NORMAL_FONT
+    cell = ws.cell(row=5, column=2, value=a.beta or 0)
+    cell.number_format = _FMT_DEC
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=5, column=3, value="Industry bottom-up, re-levered").font = _NORMAL_FONT
+
+    # Row 6: ERP [B6] blue
+    ws.cell(row=6, column=1, value="Equity Risk Premium").font = _NORMAL_FONT
+    cell = ws.cell(row=6, column=2, value=a.erp or 0)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=6, column=3, value="Damodaran implied ERP").font = _NORMAL_FONT
+
+    # Row 7: Lambda [B7] blue
+    ws.cell(row=7, column=1, value="Lambda (country exposure)").font = _NORMAL_FONT
+    cell = ws.cell(row=7, column=2, value=lambda_val)
+    cell.number_format = _FMT_DEC
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=7, column=3, value="Firm-specific country risk exposure (0-1)").font = _NORMAL_FONT
+
+    # Row 8: CRP [B8] blue
+    ws.cell(row=8, column=1, value="Country Risk Premium").font = _NORMAL_FONT
+    cell = ws.cell(row=8, column=2, value=a.country_risk_premium or 0)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=8, column=3, value="Damodaran ctryprem").font = _NORMAL_FONT
+
+    # Row 9: Cost of Equity [B9] formula
+    ws.cell(row=9, column=1, value="Cost of Equity").font = _NORMAL_FONT
+    cell = ws.cell(row=9, column=2, value="=B4+B5*B6+B7*B8")
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    ws.cell(row=9, column=3, value="Formula: Rf + Beta*ERP + Lambda*CRP").font = _NORMAL_FONT
+
+    # Row 10: Cost of Debt (pre-tax) [B10] gray
+    ws.cell(row=10, column=1, value="Cost of Debt (pre-tax)").font = _NORMAL_FONT
+    cell = ws.cell(row=10, column=2, value=a.cost_of_debt or 0)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _HARDCODED_FILL
+    ws.cell(row=10, column=3, value="Synthetic rating spread + Rf").font = _NORMAL_FONT
+
+    # Row 11: Tax Rate (effective) [B11] blue
+    ws.cell(row=11, column=1, value="Tax Rate (effective)").font = _NORMAL_FONT
+    cell = ws.cell(row=11, column=2, value=a.tax_rate or 0)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=11, column=3, value="Effective from financials").font = _NORMAL_FONT
+
+    # Row 12: Marginal Tax Rate [B12] blue
+    ws.cell(row=12, column=1, value="Marginal Tax Rate").font = _NORMAL_FONT
+    cell = ws.cell(row=12, column=2, value=marginal_tax)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=12, column=3, value="For terminal year (Damodaran convention)").font = _NORMAL_FONT
+
+    # Row 13: Debt/(Debt+Equity) [B13] green
+    ws.cell(row=13, column=1, value="Debt/(Debt+Equity)").font = _NORMAL_FONT
+    cell = ws.cell(row=13, column=2, value=debt_weight)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    ws.cell(row=13, column=3, value="From balance sheet & market cap").font = _NORMAL_FONT
+
+    # Row 14: WACC [B14] formula
+    ws.cell(row=14, column=1, value="WACC").font = _NORMAL_FONT
+    cell = ws.cell(row=14, column=2, value="=B9*(1-B13)+B10*(1-B11)*B13")
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    ws.cell(row=14, column=3, value="Formula: Ke*(1-Wd) + Kd*(1-t)*Wd").font = _NORMAL_FONT
+
+    # Row 15: blank
+
+    # Row 16: GROWTH & MARGINS section header
+    ws.cell(row=16, column=1, value="GROWTH & MARGINS")
+    _style_section_title(ws, 16, 3)
+
+    # Row 17: Revenue Growth (High) [B17] blue
+    ws.cell(row=17, column=1, value="Revenue Growth (High)").font = _NORMAL_FONT
+    cell = ws.cell(row=17, column=2, value=high_growth)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=17, column=3, value="Fundamental or historical CAGR").font = _NORMAL_FONT
+
+    # Row 18: Terminal Growth [B18] blue
+    ws.cell(row=18, column=1, value="Terminal Growth").font = _NORMAL_FONT
+    cell = ws.cell(row=18, column=2, value=a.terminal_growth or 0)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=18, column=3, value="Nominal GDP growth").font = _NORMAL_FONT
+
+    # Row 19: Operating Margin [B19] blue
+    ws.cell(row=19, column=1, value="Operating Margin (Current)").font = _NORMAL_FONT
+    cell = ws.cell(row=19, column=2, value=current_margin)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=19, column=3, value="EBIT / Revenue (current)").font = _NORMAL_FONT
+
+    # Row 20: Target Margin (Stable) [B20] blue
+    ws.cell(row=20, column=1, value="Target Margin (Stable)").font = _NORMAL_FONT
+    cell = ws.cell(row=20, column=2, value=target_margin)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=20, column=3, value="Margin at convergence").font = _NORMAL_FONT
+
+    # Row 21: Sales-to-Capital [B21] blue
+    ws.cell(row=21, column=1, value="Sales-to-Capital Ratio").font = _NORMAL_FONT
+    cell = ws.cell(row=21, column=2, value=s2c)
+    cell.number_format = _FMT_DEC
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=21, column=3, value="Revenue / Invested Capital").font = _NORMAL_FONT
+
+    # Row 22: Stable ROC [B22] blue
+    ws.cell(row=22, column=1, value="Stable ROC").font = _NORMAL_FONT
+    cell = ws.cell(row=22, column=2, value=stable_roc)
+    cell.number_format = _FMT_PCT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=22, column=3, value="Return on capital in stable state").font = _NORMAL_FONT
+
+    # Row 23: Convergence Year [B23] blue
+    ws.cell(row=23, column=1, value="Convergence Year").font = _NORMAL_FONT
+    cell = ws.cell(row=23, column=2, value=convergence_year)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _ASSUMPTION_FILL
+    ws.cell(row=23, column=3, value="Year by which margins reach target").font = _NORMAL_FONT
+
+    # Row 24: blank
+
+    # Row 25: COMPANY DATA section header
+    ws.cell(row=25, column=1, value="COMPANY DATA")
+    _style_section_title(ws, 25, 3)
+
+    # Row 26: Base Revenue [B26] green
+    ws.cell(row=26, column=1, value="Base Revenue").font = _NORMAL_FONT
+    cell = ws.cell(row=26, column=2, value=base_revenue or 0)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    ws.cell(row=26, column=3, value="TTM or latest annual (Yahoo Finance)").font = _NORMAL_FONT
+
+    # Row 27: Base EBIT [B27] green
+    ws.cell(row=27, column=1, value="Base EBIT").font = _NORMAL_FONT
+    cell = ws.cell(row=27, column=2, value=base_ebit or 0)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    ws.cell(row=27, column=3, value="Operating Income (Yahoo Finance)").font = _NORMAL_FONT
+
+    # Row 28: Cash [B28] green
+    ws.cell(row=28, column=1, value="Cash & Equivalents").font = _NORMAL_FONT
+    cell = ws.cell(row=28, column=2, value=cash)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    ws.cell(row=28, column=3, value="Balance Sheet (Yahoo Finance)").font = _NORMAL_FONT
+
+    # Row 29: Total Debt [B29] green
+    ws.cell(row=29, column=1, value="Total Debt").font = _NORMAL_FONT
+    cell = ws.cell(row=29, column=2, value=total_debt)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    ws.cell(row=29, column=3, value="Balance Sheet (Yahoo Finance)").font = _NORMAL_FONT
+
+    # Row 30: Shares Outstanding [B30] green
+    ws.cell(row=30, column=1, value="Shares Outstanding").font = _NORMAL_FONT
+    cell = ws.cell(row=30, column=2, value=shares)
+    cell.number_format = _FMT_INT
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    ws.cell(row=30, column=3, value="Yahoo Finance").font = _NORMAL_FONT
+
+    # Row 31: Current Price [B31] green
+    ws.cell(row=31, column=1, value="Current Price").font = _NORMAL_FONT
+    cell = ws.cell(row=31, column=2, value=price)
+    cell.number_format = _FMT_PRICE
+    cell.alignment = _RIGHT
+    cell.fill = _FACT_FILL
+    ws.cell(row=31, column=3, value="Yahoo Finance (market price)").font = _NORMAL_FONT
+
+    # --- Additional info rows below the fixed layout (row 33+) ---
+    row = 33
+
+    # Overrides
     if a.overrides:
-        rows.append(["", "", ""])
-        rows.append(["ANALYST OVERRIDES", "New Value", "Reason"])
+        ws.cell(row=row, column=1, value="ANALYST OVERRIDES")
+        _style_section_title(ws, row, 3)
+        row += 1
+        ws.cell(row=row, column=1, value="Parameter").font = _BOLD_FONT
+        ws.cell(row=row, column=2, value="New Value").font = _BOLD_FONT
+        ws.cell(row=row, column=3, value="Reason").font = _BOLD_FONT
+        row += 1
         for param, info in a.overrides.items():
-            rows.append([param, info.get("new"), info.get("reason", "")])
+            ws.cell(row=row, column=1, value=param).font = _NORMAL_FONT
+            ws.cell(row=row, column=2, value=info.get("new")).alignment = _RIGHT
+            ws.cell(row=row, column=3, value=info.get("reason", "")).font = _NORMAL_FONT
+            row += 1
+        row += 1
 
     # Industry benchmarks
     bm = ctx.benchmarks
-    rows.append(["", "", ""])
-    rows.append(["INDUSTRY BENCHMARKS", "", "Source"])
-    rows.append(["Industry Beta", _safe(bm.industry_beta), "Damodaran betas"])
-    rows.append(["Industry Unlevered Beta", _safe(bm.industry_unlevered_beta), "Damodaran betas"])
-    rows.append(["Industry D/E", _safe(bm.industry_de_ratio), "Damodaran betas"])
-    rows.append(["Industry WACC", _safe(bm.industry_wacc), "Damodaran wacc"])
+    ws.cell(row=row, column=1, value="INDUSTRY BENCHMARKS")
+    _style_section_title(ws, row, 3)
+    row += 1
+    for label, val, src in [
+        ("Industry Beta", bm.industry_beta, "Damodaran betas"),
+        ("Industry Unlevered Beta", bm.industry_unlevered_beta, "Damodaran betas"),
+        ("Industry D/E", bm.industry_de_ratio, "Damodaran betas"),
+        ("Industry WACC", bm.industry_wacc, "Damodaran wacc"),
+    ]:
+        ws.cell(row=row, column=1, value=label).font = _NORMAL_FONT
+        cell = ws.cell(row=row, column=2, value=_safe(val))
+        if isinstance(val, (int, float)):
+            cell.number_format = _FMT_DEC
+            cell.alignment = _RIGHT
+            cell.fill = _FACT_FILL
+        ws.cell(row=row, column=3, value=src).font = _NORMAL_FONT
+        row += 1
 
     if bm.industry_multiples:
-        rows.append(["", "", ""])
-        rows.append(["INDUSTRY MULTIPLES", "", ""])
+        row += 1
+        ws.cell(row=row, column=1, value="INDUSTRY MULTIPLES")
+        _style_section_title(ws, row, 3)
+        row += 1
         for k, v in bm.industry_multiples.items():
-            rows.append([k, _safe(v), "Damodaran"])
+            ws.cell(row=row, column=1, value=k).font = _NORMAL_FONT
+            cell = ws.cell(row=row, column=2, value=_safe(v))
+            if isinstance(v, (int, float)):
+                cell.number_format = _FMT_DEC
+                cell.alignment = _RIGHT
+            ws.cell(row=row, column=3, value="Damodaran").font = _NORMAL_FONT
+            row += 1
 
     if bm.industry_margins:
-        rows.append(["", "", ""])
-        rows.append(["INDUSTRY MARGINS", "", ""])
+        row += 1
+        ws.cell(row=row, column=1, value="INDUSTRY MARGINS")
+        _style_section_title(ws, row, 3)
+        row += 1
         for k, v in bm.industry_margins.items():
-            rows.append([k, _safe(v), "Damodaran"])
+            ws.cell(row=row, column=1, value=k).font = _NORMAL_FONT
+            cell = ws.cell(row=row, column=2, value=_safe(v))
+            if isinstance(v, (int, float)):
+                cell.number_format = _FMT_PCT if abs(v) <= 1 else _FMT_DEC
+                cell.alignment = _RIGHT
+            ws.cell(row=row, column=3, value="Damodaran").font = _NORMAL_FONT
+            row += 1
 
-    pct_params = {"risk-free rate", "equity risk premium", "country risk premium",
-                  "beta (levered)", "cost of equity", "cost of debt (pre-tax)",
-                  "wacc", "tax rate", "terminal growth", "industry wacc",
-                  "industry beta", "industry unlevered beta"}
-    growth_keywords = ("year ", "growth")
-
-    # Labels that are assumptions (blue) vs facts/benchmarks (green)
-    assumption_params = {"risk-free rate", "equity risk premium", "country risk premium",
-                         "beta (levered)", "cost of equity", "cost of debt (pre-tax)",
-                         "wacc", "tax rate", "terminal growth", "projection years"}
-    benchmark_params = {"industry beta", "industry unlevered beta", "industry d/e", "industry wacc"}
-
-    df = pd.DataFrame(rows, columns=["Parameter", "Value", "Source"])
-    df.to_excel(writer, sheet_name="Assumptions", index=False)
-
-    ws = _ws(writer, "Assumptions")
-    _hide_gridlines(ws)
-    _style_header_row(ws, 1, 3)
-
-    for row_idx in range(2, ws.max_row + 1):
-        label = ws.cell(row=row_idx, column=1).value or ""
-        val_cell = ws.cell(row=row_idx, column=2)
-
-        if _is_section_title(label):
-            _style_section_title(ws, row_idx, 3)
-            continue
-
-        ws.cell(row=row_idx, column=1).font = _NORMAL_FONT
-        label_lower = str(label).lower()
-
-        # Color coding
-        if label_lower in assumption_params:
-            val_cell.fill = _ASSUMPTION_FILL
-            source = ws.cell(row=row_idx, column=3).value
-            if source:
-                _add_comment(val_cell, f"Rationale: {source}")
-        elif label_lower in benchmark_params:
-            val_cell.fill = _FACT_FILL
-            _add_comment(val_cell, "Source: Damodaran data files")
-        elif label_lower.startswith("year ") and isinstance(val_cell.value, (int, float)):
-            val_cell.fill = _ASSUMPTION_FILL
-
-        if isinstance(val_cell.value, (int, float)):
-            if label_lower in pct_params and abs(val_cell.value) <= 3:
-                val_cell.number_format = _FMT_PCT
-            elif any(kw in label_lower for kw in growth_keywords) and abs(val_cell.value) <= 3:
-                val_cell.number_format = _FMT_PCT
-            else:
-                val_cell.number_format = _FMT_DEC
-            val_cell.alignment = _RIGHT
-
-    _autofit_columns(ws)
-    _freeze_top_row(ws)
+    # Column widths
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 40
+    ws.freeze_panes = "A2"
 
 
 def _write_dcf_model(writer: pd.ExcelWriter, ctx: ValuationContext) -> None:

@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from valuation.agents.risk_assessor import compute_cost_of_equity, compute_wacc
 from valuation.context import ValuationContext
 
 
@@ -198,16 +199,27 @@ def _propose_wacc(ctx: ValuationContext) -> Proposal | None:
     lam = 1.0
     crp = a.country_risk_premium or 0.0
     if yf_beta and a.beta and abs(a.beta - yf_beta) / a.beta > 0.30:
+        # Compute alt Ke and alt WACC using the company's own regression beta
+        alt_ke = compute_cost_of_equity(rf, yf_beta, erp, crp, lam)
+        # Infer debt/equity weights from existing Ke vs WACC relationship
+        if a.cost_of_equity and a.cost_of_equity > 0 and a.wacc != a.cost_of_equity:
+            dbt_w = max(0.0, 1.0 - (a.wacc / a.cost_of_equity))
+        else:
+            dbt_w = 0.0
+        eq_w = 1.0 - dbt_w
+        cod = a.cost_of_debt if a.cost_of_debt else (rf + 0.02)
+        tax = a.tax_rate if a.tax_rate else 0.25
+        alt_wacc = compute_wacc(alt_ke, cod, tax, eq_w, dbt_w)
+
         reasoning_parts.append(
             f"⚠ Company regression beta ({yf_beta:.2f}) is very different from "
-            f"our industry beta ({a.beta:.2f}). Using company beta would give WACC ~{rf + yf_beta * erp + lam * crp:.1%} "
+            f"our industry beta ({a.beta:.2f}). Using company beta would give WACC ~{alt_wacc:.1%} "
             f"vs current {a.wacc:.1%}"
         )
         references.append("Yahoo Finance regression beta")
-        confidence = "low"
+        confidence = 0.3
 
         # Update question to be more pointed
-        alt_wacc = rf + yf_beta * (erp + crp)
         question = (
             f"WACC is {a.wacc:.2%} (industry beta {a.beta:.2f}). "
             f"But company's own beta is {yf_beta:.2f} — "
