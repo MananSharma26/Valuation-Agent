@@ -105,7 +105,12 @@ def fetch_ibes_consensus(company_name: str, ticker: str = "", currency: str = "I
 def run(ticker: str, growth_override: float | None = None,
         terminal_override: float | None = None,
         classification_override: str | None = None,
-        accept_defaults: bool = False) -> None:
+        accept_defaults: bool = False,
+        beta_override: float | None = None,
+        wacc_override: float | None = None,
+        margin_override: float | None = None,
+        s2c_override: float | None = None,
+        n_years_override: int | None = None) -> None:
     """Run full valuation pipeline."""
 
     print(f"\n{'='*70}")
@@ -385,8 +390,12 @@ def run(ticker: str, growth_override: float | None = None,
         adjusted_invested_capital = revenue / 2  # fallback
 
     # S2C from ADJUSTED invested capital
-    s2c = revenue / adjusted_invested_capital if adjusted_invested_capital > 0 else 2.0
-    s2c = max(min(s2c, 10.0), 0.5)
+    if s2c_override is not None:
+        s2c = s2c_override
+        print(f"  S2C override: {s2c:.2f}")
+    else:
+        s2c = revenue / adjusted_invested_capital if adjusted_invested_capital > 0 else 2.0
+        s2c = max(min(s2c, 10.0), 0.5)
 
     # Adjusted margin (R&D + lease adjusted)
     adjusted_margin = adjusted_ebit / revenue if revenue > 0 else 0.15
@@ -531,17 +540,27 @@ def run(ticker: str, growth_override: float | None = None,
     erp = damodaran_erp or 0.0446
     print(f"  ERP: {erp:.2%} (Damodaran implied{'— live' if damodaran_erp else '— fallback'})")
 
-    if ctx.benchmarks.industry_unlevered_beta:
+    if beta_override is not None:
+        beta = beta_override
+        print(f"  Beta override: {beta:.3f}")
+        ctx.assumptions.set_override("beta", beta, f"CLI override: beta set to {beta}")
+    elif ctx.benchmarks.industry_unlevered_beta:
         beta = relever_beta(ctx.benchmarks.industry_unlevered_beta, company_de, tax_rate)
     else:
         beta = data.beta or 1.0
 
     ke = compute_cost_of_equity(rf, beta, erp, crp, lam)
     rating, spread = get_synthetic_rating(icr, "large")
-    cod = rf + damodaran_country_default_spread + spread  # include country default spread for non-US
+    cod = rf + damodaran_country_default_spread + spread
     eq_w = market_cap / (market_cap + total_debt) if (market_cap + total_debt) > 0 else 1.0
     dbt_w = 1 - eq_w
     wacc = compute_wacc(ke, cod, tax_rate, eq_w, dbt_w)
+
+    if wacc_override is not None:
+        wacc = wacc_override
+        ke = wacc  # approximate for reporting
+        print(f"  WACC override: {wacc:.2%}")
+        ctx.assumptions.set_override("wacc", wacc, f"CLI override: WACC set to {wacc:.2%}")
 
     ctx.assumptions.beta = beta
     ctx.assumptions.risk_free_rate = rf
@@ -676,15 +695,18 @@ def run(ticker: str, growth_override: float | None = None,
     if industry_g:
         print(f"  Industry benchmark: {industry_g:.2%}")
 
-    # Variable growth period (Damodaran: depends on classification, growth rate, barriers)
-    if ctx.company.classification == "mature" and high_growth < 0.05:
-        n_years = 5  # stable companies: short growth period
+    # Variable growth period
+    if n_years_override is not None:
+        n_years = n_years_override
+        print(f"  Growth period override: {n_years} years")
+    elif ctx.company.classification == "mature" and high_growth < 0.05:
+        n_years = 5
     elif ctx.company.classification == "growth" and high_growth > 0.20:
-        n_years = 10  # high growth with barriers: longer period
+        n_years = 10
     elif ctx.company.classification in ("mature", "cyclical"):
-        n_years = 5  # moderate growth: 5-year period
+        n_years = 5
     else:
-        n_years = 10  # default
+        n_years = 10
     print(f"  Growth period: {n_years} years")
 
     growth_rates = interpolate_params(high_growth, terminal_growth, n_years, gradual=True)
@@ -730,10 +752,12 @@ def run(ticker: str, growth_override: float | None = None,
     if not accept_defaults:
         print(f"\n{'='*70}")
         print("  ASSUMPTION GATE: Review above proposals before proceeding.")
-        print("  To run the valuation with these assumptions:")
+        print("  To run with these assumptions:")
         print(f"    python3 run_valuation.py {ticker} --accept-defaults")
-        print("  To override specific assumptions:")
-        print(f"    python3 run_valuation.py {ticker} --accept-defaults --growth 0.15 --terminal 0.04")
+        print("  To override assumptions:")
+        print(f"    python3 run_valuation.py {ticker} --accept-defaults --growth 0.15")
+        print(f"    --beta 0.45 --wacc 0.09 --terminal 0.04 --margin 0.25")
+        print(f"    --s2c 2.0 --n-years 5 --classification growth")
         print(f"{'='*70}")
         sys.exit(0)
 
@@ -1369,10 +1393,17 @@ def main():
     parser.add_argument("--classification", type=str, default=None,
                         choices=["mature", "growth", "young", "distressed", "cyclical", "financial"],
                         help="Override company classification")
+    parser.add_argument("--beta", type=float, default=None, help="Override beta (e.g., 0.45 for blended)")
+    parser.add_argument("--wacc", type=float, default=None, help="Override WACC directly (e.g., 0.09)")
+    parser.add_argument("--margin", type=float, default=None, help="Override target operating margin (e.g., 0.25)")
+    parser.add_argument("--s2c", type=float, default=None, help="Override sales-to-capital ratio (e.g., 2.5)")
+    parser.add_argument("--n-years", type=int, default=None, help="Override growth period length (e.g., 5)")
     parser.add_argument("--accept-defaults", action="store_true", default=False,
                         help="Accept computed assumptions and run valuation without stopping")
     args = parser.parse_args()
-    run(args.ticker, args.growth, args.terminal, args.classification, args.accept_defaults)
+    run(args.ticker, args.growth, args.terminal, args.classification, args.accept_defaults,
+        beta_override=args.beta, wacc_override=args.wacc, margin_override=args.margin,
+        s2c_override=args.s2c, n_years_override=args.n_years)
 
 
 if __name__ == "__main__":
