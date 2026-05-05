@@ -13,26 +13,49 @@ class WRDSClient:
         self._db = None
 
     def _connect(self):
-        """Lazy connection to WRDS. Reads credentials from ~/.pgpass."""
+        """Lazy connection to WRDS via direct sqlalchemy (no wrds library prompts)."""
         if self._db is None:
             import os
             import pathlib
+            import sqlalchemy
 
-            # Read password from .pgpass so WRDS doesn't prompt interactively
+            # Read credentials from .pgpass
+            password = None
             pgpass = pathlib.Path.home() / ".pgpass"
             if pgpass.exists():
                 for line in pgpass.read_text().strip().splitlines():
                     parts = line.split(":")
                     if len(parts) >= 5 and "wrds" in parts[0]:
-                        if "PGPASSWORD" not in os.environ:
-                            os.environ["PGPASSWORD"] = parts[4]
-                        if "PGUSER" not in os.environ:
-                            os.environ["PGUSER"] = parts[3]
+                        self._username = parts[3]
+                        password = parts[4]
                         break
 
-            import wrds
-            self._db = wrds.Connection(wrds_username=self._username)
+            if not password:
+                raise ConnectionError("No WRDS credentials found in ~/.pgpass")
+
+            from urllib.parse import quote_plus
+            engine = sqlalchemy.create_engine(
+                f"postgresql://{self._username}:{quote_plus(password)}@wrds-pgdata.wharton.upenn.edu:9737/wrds",
+                connect_args={"connect_timeout": 15},
+            )
+            self._db = engine.connect()
         return self._db
+
+    def raw_sql(self, query: str, params: dict | None = None) -> pd.DataFrame:
+        """Execute SQL and return DataFrame. Drop-in replacement for wrds.Connection.raw_sql.
+
+        Converts %(name)s style params (used by wrds library / psycopg2)
+        to :name style (used by sqlalchemy.text).
+        """
+        import re
+        import sqlalchemy
+
+        conn = self._connect()
+
+        # Convert %(name)s → :name for sqlalchemy.text()
+        converted_query = re.sub(r'%\((\w+)\)s', r':\1', query)
+
+        return pd.read_sql(sqlalchemy.text(converted_query), conn, params=params)
 
     def close(self):
         if self._db is not None:
@@ -53,14 +76,14 @@ class WRDSClient:
             query += ' AND loc=%(loc)s'
             params['loc'] = loc
         query += ' ORDER BY conm LIMIT 20'
-        return db.raw_sql(query, params=params)
+        return self.raw_sql(query, params=params)
 
     def fetch_financials_global(self, gvkey: str) -> CompanyData | None:
         """Fetch financials from Compustat Global by gvkey."""
         db = self._connect()
 
         # Annual fundamentals
-        funda = db.raw_sql('''
+        funda = self.raw_sql('''
             SELECT gvkey, conm, fyear, datadate, curcd, loc,
                    revt, sale, oibdp, oiadp, nicon,
                    at, lt, ceq, dltt, dlc, che,
@@ -80,7 +103,7 @@ class WRDSClient:
         latest = funda.iloc[0]
 
         # Get SIC code from company table
-        company_info = db.raw_sql('''
+        company_info = self.raw_sql('''
             SELECT gvkey, conm, sic, gind, loc
             FROM comp_global_daily.g_company
             WHERE gvkey = %(gvkey)s
@@ -152,7 +175,7 @@ class WRDSClient:
         """
         db = self._connect()
         table = self._ibes_table(region)
-        result = db.raw_sql(f'''
+        result = self.raw_sql(f'''
             SELECT ticker, statpers, measure, fiscalp, fpi,
                    meanest, medest, highest, lowest, numest,
                    actual, stdev
@@ -190,7 +213,7 @@ class WRDSClient:
         # Step 1: Compute per-analyst average absolute percentage error
         # Only use estimates that have an actual value and are from 2022 onward
         try:
-            accuracy_df = db.raw_sql(f"""
+            accuracy_df = self.raw_sql(f"""
                 SELECT
                     analys,
                     COUNT(*) AS num_estimates,
@@ -218,7 +241,7 @@ class WRDSClient:
         # Step 2: Get analyst names and firm codes from ptgdet (most recent per analyst)
         # amaskcd in ptgdet matches analys in det_epsus
         try:
-            names_df = db.raw_sql("""
+            names_df = self.raw_sql("""
                 SELECT DISTINCT ON (amaskcd)
                     amaskcd,
                     alysnam,
@@ -233,7 +256,7 @@ class WRDSClient:
 
         # Step 3: Get latest price target per analyst from ptgdet
         try:
-            targets_df = db.raw_sql("""
+            targets_df = self.raw_sql("""
                 SELECT DISTINCT ON (amaskcd)
                     amaskcd,
                     horizon,
@@ -249,7 +272,7 @@ class WRDSClient:
 
         # Step 4: Get latest recommendation per analyst from recddet
         try:
-            recs_df = db.raw_sql("""
+            recs_df = self.raw_sql("""
                 SELECT DISTINCT ON (amaskcd)
                     amaskcd,
                     irec
@@ -334,7 +357,7 @@ class WRDSClient:
         db = self._connect()
         try:
             # Find most recent earnings call
-            result = db.raw_sql('''
+            result = self.raw_sql('''
                 SELECT transcriptid, companyname, headline, mostimportantdateutc
                 FROM ciq_transcripts.wrds_transcript_detail
                 WHERE UPPER(companyname) LIKE UPPER(%(name)s)
@@ -349,7 +372,7 @@ class WRDSClient:
             tid = int(result.iloc[0]['transcriptid'])
 
             # Get transcript text
-            text_df = db.raw_sql('''
+            text_df = self.raw_sql('''
                 SELECT componentorder, componenttext
                 FROM ciq_transcripts.ciqtranscriptcomponent
                 WHERE transcriptid = %(tid)s
@@ -388,7 +411,7 @@ class WRDSClient:
 
         if is_us:
             # US table doesn't have curcode — search by name or ticker directly
-            result = db.raw_sql('''
+            result = self.raw_sql('''
                 SELECT DISTINCT ticker, cname, 'USD' as curcode
                 FROM tr_ibes.statsum_epsus
                 WHERE UPPER(cname) LIKE UPPER(%(name)s)
@@ -396,14 +419,14 @@ class WRDSClient:
             ''', params={'name': f'%{company_name}%'})
             # Also try exact ticker match
             if result.empty:
-                result = db.raw_sql('''
+                result = self.raw_sql('''
                     SELECT DISTINCT ticker, cname, 'USD' as curcode
                     FROM tr_ibes.statsum_epsus
                     WHERE ticker = %(ticker)s
                     LIMIT 5
                 ''', params={'ticker': company_name.upper()})
         else:
-            result = db.raw_sql('''
+            result = self.raw_sql('''
                 SELECT DISTINCT ticker, cname, curcode
                 FROM tr_ibes.statsum_epsint
                 WHERE UPPER(cname) LIKE UPPER(%(name)s)
