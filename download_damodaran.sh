@@ -1,7 +1,9 @@
 #!/bin/bash
 BASE="https://pages.stern.nyu.edu/~adamodar/pc/datasets"
 BASE2="https://pages.stern.nyu.edu/~adamodar/pc"
-DIR="/mnt/c/Users/Manan Sharma/Desktop/Coding projects/Valuation/0. Valuation Agent/damodaran_data"
+# Use DATA_DIR env var if set, otherwise default to damodaran_data/ relative to this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIR="${DATA_DIR:-$SCRIPT_DIR/damodaran_data}"
 TOTAL=0
 FAIL=0
 
@@ -9,7 +11,7 @@ dl() {
   local url="$1"
   local dest="$2"
   local file=$(basename "$url")
-  if wget -q --no-check-certificate -O "$dest/$file" "$url" 2>/dev/null; then
+  if wget -q -O "$dest/$file" "$url" 2>/dev/null; then
     TOTAL=$((TOTAL+1))
   else
     echo "FAILED: $url"

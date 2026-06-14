@@ -42,14 +42,27 @@ jobs:
           echo "${{ secrets.WRDS_PGPASS }}" > ~/.pgpass
           chmod 600 ~/.pgpass
 
+      - name: Validate inputs
+        run: |
+          TICKER="${{ inputs.ticker }}"
+          if ! echo "$TICKER" | grep -qE '^[A-Za-z0-9.\-]{1,20}$'; then
+            echo "::error::Invalid ticker format: $TICKER (only alphanumeric, dots, hyphens allowed)"
+            exit 1
+          fi
+          echo "Ticker validated: $TICKER"
+
       - name: Fetch company data
         id: fetch
+        env:
+          TICKER: ${{ inputs.ticker }}
         run: |
           python3 -c "
+          import os
           from valuation.data.api_client import fetch_financials
-          data = fetch_financials('${{ inputs.ticker }}')
+          ticker = os.environ['TICKER']
+          data = fetch_financials(ticker)
           if data is None:
-              print('::error::Failed to fetch data for ${{ inputs.ticker }}')
+              print(f'::error::Failed to fetch data for {ticker}')
               exit(1)
           print(f'::notice::Company: {data.name}')
           print(f'::notice::Sector: {data.sector} | Industry: {data.industry}')
@@ -58,9 +71,14 @@ jobs:
           "
 
       - name: Run full valuation
+        env:
+          TICKER: ${{ inputs.ticker }}
+          GROWTH_RATE: ${{ inputs.growth_rate }}
+          TERMINAL_GROWTH: ${{ inputs.terminal_growth }}
+          CLASSIFICATION: ${{ inputs.classification }}
         run: |
           python3 << 'PYEOF'
-          import sys, json, pathlib
+          import sys, json, pathlib, os
           from valuation.data.api_client import fetch_financials
           from valuation.data.normalizer import normalize
           from valuation.data.damodaran_loader import DamodaranLoader
@@ -75,10 +93,10 @@ jobs:
           from valuation.reports.generator import generate_report, save_report
           from valuation.validation.pre_engine import validate_for_dcf
 
-          ticker = "${{ inputs.ticker }}"
-          growth_override = "${{ inputs.growth_rate }}" or None
-          terminal_override = "${{ inputs.terminal_growth }}" or None
-          class_override = "${{ inputs.classification }}" or None
+          ticker = os.environ["TICKER"]
+          growth_override = os.environ.get("GROWTH_RATE") or None
+          terminal_override = os.environ.get("TERMINAL_GROWTH") or None
+          class_override = os.environ.get("CLASSIFICATION") or None
 
           print(f"::group::Step 1 - Fetch Data")
           data = fetch_financials(ticker)

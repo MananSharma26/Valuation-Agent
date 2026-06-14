@@ -8,7 +8,7 @@ from valuation.data.api_client import CompanyData
 class WRDSClient:
     """Client for WRDS database queries."""
 
-    def __init__(self, username: str = "manan26"):
+    def __init__(self, username: str = ""):
         self._username = username
         self._db = None
 
